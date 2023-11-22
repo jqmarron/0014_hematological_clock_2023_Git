@@ -1,0 +1,126 @@
+---
+title: "Hematological Clock"
+author: "Jorge Martinez-Romero, Carlos Serrano"
+date: "7/6/2022"
+output: pdf_document
+---
+
+```{r libraries, echo=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+library("tidyverse")
+library("DataCombine")
+library("rio")
+library("feather")
+library("hexView")
+library("pzfx")
+library("readODS")
+library("rmatio")
+library("readxl")
+library("magrittr")
+```
+
+
+```{r data loadings, message=FALSE, warning=FALSE}
+
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=20000,future.globals.maxSize = 4000 * 1024^5)
+
+cms_census  <- rio::import(paste(patho, "Tables/Source/CMS.xlsx", sep="")) 
+slam_census <- rio::import(paste(patho, "Tables/Source/Census_SLAM_C1 to C16.xlsx", sep="")) 
+Advia       <- rio::import(paste(patho, "Tables/Source/Original_Advia.csv", sep="")) # 
+HC          <- rio::import(paste(patho, "Tables/Source/SLAM Healthcard.xlsx",sep=""))
+GLU         <- rio::import(paste(patho, "Tables/Source/SLAM C1-C10 Glucose-Lactate Values.csv",sep=""))
+BW          <- rio::import(paste(patho, "Tables/Source/BW_Temp_FC_All_detailed_2021-01-25.csv",sep=""))
+
+```
+
+## Preprocessing SLAM dataframe
+```{r data pre-processing}
+###################################################################################
+# Wide-format data merging. ####
+census <- # Full merge of cms and slam census data on "Animal ID" and ""animal_ID, respectively, after saving variables as "ratID".
+ inner_join(
+  cms_census  %>% mutate(ratID =`Animal ID`%>%factor()) ,
+  slam_census %>% mutate(ratID = animal_ID %>%factor()) %>% dplyr::select("ratID", setdiff( colnames(slam_census), colnames(cms_census) )) ,
+  by="ratID") %>% # use "Strain" variable, more complete than "strain" lower case.
+ filter(!is.na(idno)) %>% # Removing animals with missing "idno".
+ filter(cohort<=10) %>% # Removing animals from "cohorts" 11 or greater.
+ left_join(., HC[c("Tag", setdiff( colnames(HC), colnames(.) ))], by="Tag") %>% # Merge SLAM health card data using variable "Tag".
+ filter( is.na(Condition) | str_detect(Condition, ".ightin|.njur", negate = TRUE) ) %>% # Remove rats that fought or were injured.
+ arrange(idno) %>% 
+ group_by(idno) %>% slice(1) # One record per animal.
+ 
+
+###################################################################################
+# Modifying GLU and BW.
+GLU %<>% mutate(
+  idno    = idno         %>% as.integer(),
+  date    = date         %>% lubridate::mdy(tz=Sys.timezone()) %>% lubridate::as_date(),
+  Glucose = Glucose      %>% as.numeric(),
+  Lactate = Lactate      %>% as.numeric() ) %>% 
+  
+  dplyr::select(idno, date, Glucose, Lactate) %>% 
+  arrange(idno, date) %>% 
+  group_by(idno) 
+
+BW  %<>% mutate(
+  idno    = idno %>% as.integer(),
+  date = date %>% lubridate::as_date(),
+  bw   = bw %>% as.numeric(),
+  temp = temp %>% as.numeric() ) %>%
+  
+  dplyr::select(idno, date, bw, temp) %>% 
+  arrange(idno, date) %>% 
+  group_by(idno)
+
+###################################################################################
+# Full merge between "GLU" and "BW" on "idno" and "date". Yields incomplete "dob" and "age", improved below.
+bw_glu <- 
+  full_join(BW, GLU , by=c("idno","date"), suffix = c("",".GLU")) %>% 
+  filter( !is.na(idno) ) # Removing "idno" that are "NA". Number of rows: 36.
+
+###################################################################################
+# Long-format data: merging "Advia", "BW", "GLU" data sets and creating variables #####
+data <- Advia %>% 
+ mutate( # Convert "Identifier" into a numeric column under variable "idno" and "Date/time" into a simple date data type.
+   idno = Identifier  %>% as.integer(),
+   date = `Date/Time` %>% lubridate::mdy_hms(tz=Sys.timezone(), truncated = 3, quiet = TRUE) %>% lubridate::as_date() ) %>% 
+ filter( !is.na(idno) & idno <= max(bw_glu$idno) ) %>% # Removing animals with missing "idno".
+ arrange(idno, date) %>% #slice(1) %>% # eliminating duplicated "idno-date" combinations.
+
+ left_join(., bw_glu  , by=c("idno","date") ) %>% # Merging "bw_glu" data onto created "idno" variable in "Advia" data.
+ left_join(., census[, c("idno", setdiff( colnames(census), colnames(.))) ], by="idno") %>% 
+ group_by( idno ) %>%
+ fill( Born, .direction = "downup") %>% 
+ filter( !is.na(Born) )
+
+###################################################################################
+# Modifying data created above#####
+type <- c("DVR or Pathology","Culled Per Vet","Found dead","Per PI","Culled","Found Dead","Cull Per Vet","Cull per vet","Cull Per Pi")
+
+data %<>%
+ dplyr::mutate(
+  idno          = idno %>% factor() ,
+  Died          = Died %>% lubridate::as_date() ,
+  Born          = Born %>% lubridate::as_date() ,
+  Last_Access   = `Last Access` %>% as.Date(tz=Sys.timezone(), origin="1970-01-01") %>% lubridate::as_date() ,
+  status        = case_when(is.na(Died) ~ 0, TRUE ~ 1) ,
+  event_date    = case_when(is.na(Died) ~ Last_Access, TRUE ~ Died) ,
+  lifespan      = (event_date - Born) %>% lubridate::time_length("weeks") ,
+  Age_wk        = (event_date - Born) %>% lubridate::time_length("weeks") , 
+  age_at_death  = (Died - Born) %>% lubridate::time_length("weeks") ,
+  Date_assy     = date,
+  age_at_assy   = (Date_assy - Born) %>% lubridate::time_length("weeks"),
+  remain        = lifespan - age_at_assy,
+  natural_death = case_when(any(purrr::map_lgl(CoD, ~  . %in% type)) ~ 1, status==0 ~ 2, TRUE ~ 0),
+ ) %>%
+
+  filter( remain>=0 )
+
+```
+
+```{r eval=FALSE}
+saveRDS(data , file = paste(patho, "Tables/Transitions/Census_Advia_BW_GLU_processed_2022-08-13.rds",sep=""))
+```

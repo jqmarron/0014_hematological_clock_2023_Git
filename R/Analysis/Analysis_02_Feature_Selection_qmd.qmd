@@ -1,0 +1,246 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "(Sex : All, Strain: All) "
+author: "Jorge Martinez-Romero"
+date: "2023-07-28"
+format: html 
+toc: true   
+self-contained: true  
+---
+
+## FEATURE SELECTION
+
+Goal: Find minimum adequate model 
+Strategy: To determine the minimal adequate model, use the DNN cross validation process to determine feature importance using Gedeon et al. approach explained in DATA MINING OF INPUTS: ANALYSING MAGNITUDE AND FUNCTIONAL MEASURES.
+T D Gedeon 1 DOI: 10.1142/s0129065797000227.
+Compare DNN predictive performance removing one feature at a time starting from lower importance to higher importance using the ranking of variables obtained in the initial DNN trained during previous process 'model selection' and including 19 varaibles. Select the model with higher R, lower MAE, and lower number of features in the 10FCV.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+
+```
+
+
+
+## Load packages
+```{r libraries, echo=FALSE, include=FALSE}
+library("dplyr")
+library("h2o")
+library("Metrics")
+library("kableExtra")
+library("groupdata2")
+library("tidyverse")
+```
+
+
+## Retrieve data
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+rm(pa)
+```
+
+
+## Load DNN model to extract Feature Importance
+### DNN built during the model selection process
+```{r}
+h2o.init(nthreads = -1)
+pat<-paste0(patho,"Models/Model_Selection/Models_DNN_ALL_GB_Blood_NoDeltas/DNN_ALL_GB_Blood_NoDeltas_Rep1_N1692292418.zip",sep="")
+
+imported_model <- h2o.import_mojo(pat)
+
+
+```
+
+## DNN Feature importance in 10-Fold CV 
+### Extract the Ranking of features determined in  the model selection process
+```{r}
+Ranking<-imported_model@model[["variable_importances"]][1:22,]
+kable(Ranking)%>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+```{r}
+#To consider variables instead of levels (Difficult to interpret) we determine feature importance as the higher level importance.  
+rank1<-Ranking[-c(4,6,9),] #
+rank1[1,1]<-"sex"
+rank1[3,1]<-"strain"
+rank2<-as.data.frame(rank1[,1])#select only the feature
+colnames(rank2)<-"Importance"
+kable(rank2) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### Select All features (19) for later elimination
+```{r}
+Features<-c("rbc","mcv","mch","mchc","chcm","rdw","hdw","mpv",    
+            "p.lym","n.eos","wbc","n.neuts","p.eos","p.mono","plt",
+            "glucose","bw") 
+```
+
+
+### Deep Neural Network loop 
+#### Function DNN
+##### Trains one DNN by crosvalidation removing features one at a time from bottom importance to top according to the ranking
+```{r}
+DNN_FS<-function(tr,ts,tv,CV,re,delta,eti,pdtors,Outcome,Pheno,rank1){
+  tr[,"ID"]<-as.factor(tr[,"ID"])
+  if(delta==1){tr<-Add_delta_variable(tr,Features,id="ID")
+  ts<-Add_delta_variable(ts,Features,id="ID")
+  tv<-Add_delta_variable(tv,Features,id="ID")
+  num<-"_YesDelta"
+  tr[is.na(tr)]=0#Baseline delta to 0 
+  ts[is.na(ts)]=0
+  tv[is.na(tv)]=0
+  Predictors<-c(pdtors,colnames(tr)[grepl("Delta.",colnames(tr))])
+  }else{Predictors<-pdtors
+  num<-"_NoDeltas"}
+  
+  dff<-data.frame(Model=rep(NA,re),R_t=rep(NA,re),
+                 CI1_t=rep(NA,re),CI2_t=rep(NA,re),
+                 Pval_t=rep(NA,re),RMSE_t=rep(NA,re),
+                 MAE_t=rep(NA,re),R_v=rep(NA,re),
+                 CI1_v=rep(NA,re),CI2_v=rep(NA,re),
+                 Pval_v=rep(NA,re),RMSE_v=rep(NA,re),MAE_v=rep(NA,re))
+  
+  folds_df<-as.data.frame(matrix(rep(NA,nrow(tr)*re),ncol = re))
+  colnames(folds_df)<-gsub("V","Repe_",colnames(folds_df)) 
+  tr$ID<-as.factor(as.character(tr$ID))
+  colN<-c(Predictors,Pheno,Outcome,".folds")
+  ts<-ts %>% arrange(ID,wave) %>% as.data.frame()
+  tr<-tr %>% arrange(ID,wave) %>% as.data.frame()
+  tv<-tv %>% arrange(ID,wave) %>% as.data.frame()
+  j<-1  
+  big_list<-list() 
+  folds <- groupdata2::fold(tr, k = CV, id_col ="ID",
+                              cat_col = c('strain','cohort','sex'))
+  folds$sex<-as.factor(folds$sex); ts$sex<-as.factor(ts$sex);
+    tv$sex<-as.factor(tv$sex)
+  trainh2o2 <- as.h2o(folds[,colN])
+  y <- "age_wk"
+  x <- setdiff(setdiff(colnames(trainh2o2),y),".folds")
+  Validate <- as.h2o(ts[,setdiff(colN,".folds")])
+  Validate2 <- as.h2o(tv[,setdiff(colN,".folds")])
+  iter<-length(rank1)-1
+  
+  for (j in 1:re){ 
+    x<- setdiff(rank1$variable,tail(rank1$variable,j))
+    model_id<-paste0(eti,num,length(x),"_feats_N",format(Sys.time(), "%s"),collapse = "_")
+    model_folder<-paste0(patho,"Models/Feature_Selection/Models_",eti,num,collapse = "_")
+    dl_model <- h2o.deeplearning(x = x,
+                                 y = y,
+                                 model_id = model_id,
+                                 training_frame = trainh2o2,
+                                 fold_column=".folds",  
+                                 activation = "RectifierWithDropout",
+                                 stopping_metric = "AUTO",
+                                 stopping_tolerance = 1e-02,
+                                 stopping_rounds = 3,
+                                 keep_cross_validation_fold_assignment=TRUE,
+                                 variable_importances=TRUE
+                                 )
+    Hematology_Based_Age_Test<-h2o.predict(object = dl_model, newdata =Validate)
+    Hematology_Based_Age_Test2<-h2o.predict(object = dl_model, newdata =Validate2)
+    Hematology_Based_Age_Test<-as.vector(Hematology_Based_Age_Test)
+    Hematology_Based_Age_Test2<-as.vector(Hematology_Based_Age_Test2)
+    
+    
+    r_test<-cor.test(Hematology_Based_Age_Test,ts$age_wk)
+    r_vdte<-cor.test(Hematology_Based_Age_Test2,tv$age_wk)
+    
+    dff[j,"Model"]<-model_id
+    dff[j,"R_t"]<-round(r_test$estimate,digit=2)
+    dff[j,"CI1_t"]<-round(r_test$conf.int[[1]],digit=2)
+    dff[j,"CI2_t"]<-round(r_test$conf.int[[2]],digit=2)
+    dff[j,"Pval_t"]<-round(r_test$p.value,digit=2)
+    dff[j,"RMSE_t"]<-round(rmse(ts$age_wk,Hematology_Based_Age_Test),digit=2)
+    dff[j,"MAE_t"]<-round(mae(ts$age_wk,Hematology_Based_Age_Test),digit=2)
+    dff[j,"R_v"]<-round(r_vdte$estimate,digit=2)
+    dff[j,"CI1_v"]<-round(r_vdte$conf.int[[1]],digit=2)
+    dff[j,"CI2_v"]<-round(r_vdte$conf.int[[2]],digit=2)
+    dff[j,"Pval_v"]<-round(r_vdte$p.value,digit=2)
+    dff[j,"RMSE_v"]<-round(rmse(tv$age_wk,Hematology_Based_Age_Test2),digit=2)
+    dff[j,"MAE_v"]<-round(mae(tv$age_wk,Hematology_Based_Age_Test2),digit=2)
+    if(!file.exists(model_folder)){dir.create(model_folder)}
+    mojo_destination <- h2o.save_mojo(dl_model, path = model_folder)
+    big_list[[j]] <- dl_model
+    names(big_list)[[j]] <- model_id
+    print(j)
+  }
+  assign(paste0("List_",model_id,sep=""),big_list, envir = globalenv())
+  assign(paste0("Results_",model_id,sep=""),dff, envir = globalenv())
+  assign(paste0("F10CV_",model_id,sep=""),folds_df, envir = globalenv())
+  return
+}
+```
+
+
+
+```{r,eval=FALSE, render=TRUE}
+
+CVV<-10 #Number of folds to crossvalidate
+ree<-18 # Number of eliminations: 19 predictors (17 Features + sex + strain) -> 18 iterations.
+tra<-train 
+tst<-validate2
+tvt<-vald
+DNN_FS(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,rank1=rank1,
+       delta=0,
+       eti="DNN_Feature_Imp",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+
+
+```{r,eval=FALSE}
+#Manually cache
+save.image(paste0(patho,"Tables/Transitions/Feature_Selection.Rdata",sep=""))
+```
+
+
+```{r}
+load(paste0(patho,"Tables/Transitions/Feature_Selection.Rdata",sep=""))
+```
+
+### Table with all DNN models (from 18 to 1 predictors) 
+```{r}
+big_list<-List_DNN_Feature_Imp_NoDeltas1_feats_N1692636867
+grid_scores <- tibble(mod_id = names(big_list),
+                      r2_10FCV = map_dbl(big_list,
+                                        function(x) h2o.r2(x, xval = TRUE)),
+                      mae_10FCV = map_dbl(big_list,
+                                        function(x) h2o.mae(x, xval = TRUE)),
+                      rmse_10FCV = map_dbl(big_list,
+                                        function(x) h2o.rmse(x, xval = TRUE)))
+
+rm(big_list)
+Results<-grid_scores %>% mutate(r_10FCV=round(sqrt(abs(r2_10FCV)),digit=2)) %>% 
+                            select(-r2_10FCV)
+kable(Results) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r}
+#Manually cache the loop
+#save.image(paste0(patho,"Tables/Feature_Importance.Rdata",sep=""))
+
+```
+### Best set of predictors
+Extract best set of predictors after feature selection.
+Criteria: inflexion point MAE/RMSE/R and less number of predictors in the  10F-CV process with the training set (72%) 
+```{r}
+FS<-List_DNN_Feature_Imp_NoDeltas1_feats_N1692636867[["DNN_Feature_Imp_NoDeltas12_feats_N1692636693"]]@parameters[["x"]]
+FS
+
+```
+List of parameters
+```{r}
+RRR<-list()
+i<-1
+for (l in List_DNN_Feature_Imp_NoDeltas1_feats_N1692636867){
+  RRR[[i]]<-l@parameters$x %>% paste0
+  i<-i+1}
+```
+
+

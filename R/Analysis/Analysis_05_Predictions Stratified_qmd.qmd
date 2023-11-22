@@ -1,0 +1,319 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`) "
+
+author: "Jorge Martinez-Romero"
+date: "2023-07-28"
+format: html 
+params:
+  sex: "All" # "F", "M", "All". 
+  strain: "All" # "B6", "HET3", "DO", "All"
+toc: true   
+self-contained: true  
+---
+
+## DATA ANALYSIS (CLOCK'S PREDICTIONS STRATIFIED)
+Use Sex and Strain for stratification
+
+```{r setup, include=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+GOAL: Validation and clock's predictions by strata 
+
+## Parameters
+### Parameters explanation.
+- sex: "F".  Select sex: "F", "M", "All".
+- strain: "All".  Select strain: "B6", "HET3", "DO", "All".
+
+
+
+```{r libraries, echo=FALSE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("ggplot2")
+library("tidyverse")
+library("dplyr")
+library("survival") 
+library("Metrics")
+library("h2o")
+library("data.table")
+library("Metrics")
+library("ggplot2")
+```
+
+## Retrieve data and predict
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+rm(pa)
+#Update last information from NIH-NIA-CMS pathology cause of death
+Survival_CMS <- read_csv(paste(patho,"Tables/Source/Survival_detailed_2023-07-25.csv",sep=""),col_types = cols(cohort = col_factor(levels = c("1",
+"2", "3", "4", "5", "6", "7", "8",
+"9", "10")), sex = col_factor(levels = c("F",
+"M")), strain = col_factor(levels = c("B6",
+"HET3")), tod = col_date(format = "%m/%d/%Y"),
+dob = col_date(format = "%m/%d/%Y"),
+dead_censor_nat = col_factor(levels = c("0",
+"1"))))
+#filter animals cohort 1-10 and natural death
+CMS<-Survival_CMS %>% mutate(ID=as.factor(paste0("C",idno,dif="")),
+                             lifespan=age_wk) %>% 
+                              select("ID","project","cohort","lifespan",
+                                     "cod","sex","strain","dead_censor_nat") %>% 
+                                filter(project=="SLAM"& !is.na(cohort) & dead_censor_nat==1) %>% as.data.frame()
+```
+
+
+
+1)  Function add deltas
+
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+### Select features to add delta variable (No categoricals)
+
+```{r}
+Features<-c("rbc","mcv","mchc","mch","chcm","hdw"  
+,"wbc","plt","glucose","bw")
+```
+
+***
+```{r}
+Features
+```
+***
+#### Load best DNN after tuning
+
+```{r}
+library(h2o)
+h2o.init()
+#DNN_ALL_GB_Blood_YesDelta_Rep1_N1691007697
+pat<-paste0(patho,"Models/Models_tunning/DNN_blood_62_N1691016783.zip",sep="")
+#pat<-paste0(patho,"Models/Feature_Selection/Models_DNN_Feature_Imp_YesDelta/DNN_Feature_Imp_YesDelta_Rep1_N1690817609.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+
+```
+
+### Validate best DNN after tuning Hyperparameters
+#### Validate2 set (Pool of cohorts) 
+
+
+```{r,warning=FALSE}
+if(params$sex != "All"){
+ train<-train %>% filter(sex==params$sex)
+ vald<-vald %>% filter(sex==params$sex)
+ validate2<-validate2 %>% filter(sex==params$sex)
+ CMS<-CMS %>% filter(sex==params$sex)
+ Sx<-unique(as.character(train$sex))
+cat("Sex = ", Sx)
+}
+```
+
+
+```{r,warning=FALSE}
+if(params$strain != "All"){
+ train<-train %>% filter(strain==params$strain)
+ vald<-vald %>% filter(strain==params$strain)
+ validate2<-validate2 %>% filter(strain==params$strain)
+ CMS<-CMS %>% filter(strain==params$strain)
+ St<-unique(as.character(train$strain))
+ cat("Strain = ", St)
+ }
+```
+
+```{r}
+if(params$strain == "All"){St<-" All strains."}
+if(params$sex == "All"){Sx<-" Both sexes. "}
+```
+
+
+#### Validation set (Random cohort 7 and G8)
+```{r,warning=FALSE}
+data<-vald
+data<-Add_delta_variable(data,Features,id="ID")
+Validate <- as.h2o(data)
+Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+    Hematology_Based_Age<-as.vector(Hematology_Based_Age)
+    r_validate<-cor.test(Hematology_Based_Age,data$age_wk)
+    r_v<-cor(Hematology_Based_Age,data$age_wk)
+data$predicted_age<-Hematology_Based_Age    
+r_validate
+```
+
+```{r}
+MAE_validate<-round(mae(data$age_wk,Hematology_Based_Age),digit=2)
+cat("MAE_validate:",MAE_validate)
+```
+
+
+```{r, fig.width=8,fig.height=10, cache=FALSE }
+  R1<-round(r_v,digits=2) #Best rscore in validation dataset
+  Title<-paste0("Cohort C07-G08 set. Sex:", Sx,", Strain: ", St," N: ",dim(data)[1]," observations",sep="")
+  Title
+```
+
+```{r}
+S0<-(ggplot(data, aes(x = age_wk, y=predicted_age))+labs(main=Title)+
+          xlab("Chronological age (weeks)") +  ylab("Blood age (weeks)")+
+          geom_jitter(colour = "skyblue4", size = 1.5,alpha = 3/10, height = 5, width = 2) +
+          geom_abline(intercept = 0, slope = 1, size = 0.2,col = "black") +  
+          stat_smooth(method = "lm", col = "darkred",  level = 0.999,fullrange = TRUE, size=0.5)+
+          #theme(panel.background = element_rect(fill = "wheat"),
+           #     axis.text = element_text(size = 15),
+            #    axis.title = element_text(size = 15)) +
+          theme(panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 7),
+        panel.border = element_rect(color = "black",
+                                    fill = NA,
+                                    size = 0.5),
+        panel.grid.major = element_line(size = 0.15, linetype = 'solid',
+                                colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'solid',
+                                 colour = "grey"),
+        plot.margin = margin(0.5,0.5,0.5,0.5, "cm"))+
+          xlim(0,150)+
+          ylim(0,150)+
+           annotate(geom = "text", x = 140, y = 145, label = "45°", color = "black",
+             angle = 42, size = 1.5)+
+          annotate(geom="text", x=125, y=15, label=paste0("r = ",as.character(R1)),
+                   color="red",size = 2.5)+
+          annotate(geom="text",x=45, y=140,label=paste0("MAE: ",MAE_validate," weeks",sep=""),
+                   color="red",size = 2.5)+
+          annotate(geom="text",x=40, y=130,label=paste0( dim(data)[1]," observations",sep=""),
+                   color="black",size = 2))
+          
+print(S0)
+ggsave(paste0(patho,"Plots/R_val_C7_G8_",params$sex,".tiff",sep=""),
+S0, device = "tiff", width = 6, height = 6,
+  units = c("cm"),dpi = 450)
+```
+#### Validation (All_held_out)
+
+```{r,warning=FALSE}
+data<-rbind(validate2,vald)
+data<-Add_delta_variable(data,Features,id="ID")
+Validate <- as.h2o(data)
+Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+    Hematology_Based_Age<-as.vector(Hematology_Based_Age)
+    r_validate2<-cor.test(Hematology_Based_Age,data$age_wk)
+    r_v2<-cor(Hematology_Based_Age,data$age_wk)
+data$predicted_age<-Hematology_Based_Age    
+r_validate2
+```
+
+```{r}
+MAE_v2<-round(mae(data$age_wk,Hematology_Based_Age),digit=2)
+cat("MAE_validate2:",MAE_v2)
+```
+
+```{r, fig.width=8,fig.height=10, cache=FALSE }
+  R1_v2<-round(r_v2,digits=2) #Best rscore in validation dataset
+  Title<-paste0("Validation set. Sex:", Sx,", Strain: ", St," N: ",dim(data)[1]," observations",sep="")
+  Title
+```
+
+
+```{r, fig.width=8,fig.height=10, cache=FALSE }
+S1<-(ggplot(data, aes(x = age_wk, y=predicted_age))+labs(main=Title)+
+          xlab("Chronological age (weeks)") +  ylab("Blood age (weeks)")+
+          geom_jitter(colour = "skyblue4", size = 1.5,alpha = 3/10, height = 5, width = 2) +
+          geom_abline(intercept = 0, slope = 1, size = 0.2,col = "black") +  
+          stat_smooth(method = "lm", col = "darkred",  level = 0.999,fullrange = TRUE, size=0.5)+
+        theme(panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 7),
+        panel.border = element_rect(color = "black",
+                                    fill = NA,
+                                    size = 0.5),
+        panel.grid.major = element_line(size = 0.15, linetype = 'solid',
+                                colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'solid',
+                                 colour = "grey"),
+        plot.margin = margin(0.5,0.5,0.5,0.5, "cm"))+
+          xlim(0,150)+
+          ylim(0,150)+
+           annotate(geom = "text", x = 140, y = 145, label = "45°", color = "black",
+             angle = 42, size = 1.5)+
+          annotate(geom="text", x=125, y=15, label=paste0("r = ",as.character(R1_v2)),
+                   color="red",size = 2.5)+
+          annotate(geom="text",x=45, y=140,label=paste0("MAE: ",MAE_v2," weeks",sep=""),
+                   color="red",size = 2.5)+
+          annotate(geom="text",x=40, y=130,label=paste0( dim(data)[1]," observations",sep=""),
+                   color="black",size = 2))
+
+
+print(S1)
+ggsave(paste0(patho,"Plots/R_validation_",params$sex,".tiff",sep=""),
+S1, device = "tiff", width = 6, height = 6,
+  units = c("cm"),dpi = 450)
+```
+#### Training dataset
+```{r}
+data<-train
+data<-Add_delta_variable(data,Features,id="ID")
+Validate <- as.h2o(data)
+Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+    Hematology_Based_Age<-as.vector(round(Hematology_Based_Age,digit=0))
+data$predicted_age<-Hematology_Based_Age 
+r_train<-round(cor(data$age_wk,data$predicted_age),digit=2)
+MAE_train<-round(mae(data$age_wk,data$predicted_age),digit=2)
+```
+```{r, fig.width=6,fig.height=6, cache=FALSE}
+library(Metrics)
+library(ggplot2)
+R11<-round(r_train,digits=2) #Best rscore in validation dataset
+Title2<-paste0("Training dataset. ", Sx," ", St,"\nN: ",dim(data)[1]," observations",sep="")
+```
+
+
+```{r, fig.width=6,fig.height=6, cache=FALSE}
+S2<-(ggplot(data, aes(x = age_wk, y=predicted_age))+labs(main=Title)+
+          xlab("Chronological age (weeks)") +  ylab("Blood age (weeks)")+
+          geom_jitter(colour = "skyblue4", size = 1.5,alpha = 3/10, height = 5, width = 2) +
+          geom_abline(intercept = 0, slope = 1, size = 0.2,col = "black") +  
+          stat_smooth(method = "lm", col = "darkred",  level = 0.999,fullrange = TRUE, size=0.5)+
+          #theme(panel.background = element_rect(fill = "wheat"),
+           #     axis.text = element_text(size = 15),
+            #    axis.title = element_text(size = 15)) +
+          theme(panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 7),
+        panel.border = element_rect(color = "black",
+                                    fill = NA,
+                                    size = 0.5),
+        panel.grid.major = element_line(size = 0.15, linetype = 'solid',
+                                colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'solid',
+                                 colour = "grey"),
+        plot.margin = margin(0.5,0.5,0.5,0.5, "cm"))+
+          xlim(0,150)+
+          ylim(0,150)+
+           annotate(geom = "text", x = 140, y = 145, label = "45°", color = "black",
+             angle = 42, size = 1.5)+
+          annotate(geom="text", x=125, y=15, label=paste0("r = ",as.character(R11)),
+                   color="red",size = 2.5)+
+          annotate(geom="text",x=45, y=140,label=paste0("MAE: ",MAE_train," weeks",sep=""),
+                   color="red",size = 2.5)+
+          annotate(geom="text",x=40, y=130,label=paste0( dim(data)[1]," observations",sep=""),
+                   color="black",size = 2))
+          
+print(S2)
+ggsave(paste0(patho,"Plots/R_train_",params$sex,".tiff",sep=""),
+S2, device = "tiff", width = 6, height = 6,
+  units = c("cm"),dpi = 450)
+```
+

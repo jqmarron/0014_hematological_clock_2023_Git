@@ -1,0 +1,516 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "(Sex : All, Strain: All) "
+author: "Jorge Martinez-Romero"
+date: "2023-07-28"
+format: html 
+toc: true   
+self-contained: true  
+---
+
+
+
+## MODEL SELECTION
+### Goal: Predict age using 19 variables 
+
+Three algorithms comparison with default setting:.
+
+- GBM: Based on gradient-boosted trees, which typically outperforms the random forest algorithm. 
+- GLM: Common approach for building epi-genetic clocks. 
+- DNN: Deep Learning algorithm, previously used in blood clocks with good results. All three implemented on H2O (open source, in-memory, fast, and scalable machine learning and predictive analytics platform).
+
+Strategy: 
+-Use the training set only to select the model in a 10FCV. 
+-Use the same platform H2O with the default setting for fair comparison.
+-Use the 19 overlapping (JAX-SLAM) predictor in the three cases.
+-Select the model with minimum MAE in the 10FCV.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_Clock_2023_Git/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+
+```
+
+```{r libraries, echo=FALSE, include=FALSE}
+library("dplyr")
+library("survival") 
+library("h2o")
+library("Metrics")
+library("groupdata2")
+library("data.table")
+library("kableExtra")
+library("mltools")
+library("data.table")
+library("ggplot2")
+```
+
+### Retrieve data
+
+```{r Retrieve Advia}
+
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+rm(pa)
+```
+
+### Select features overlapping the two studies
+
+```{r}
+Features<-c("rbc","mcv","mch","mchc","chcm","rdw","hdw","mpv",    
+            "p.lym","n.eos","wbc","n.neuts","p.eos","p.mono","plt",
+            "glucose","bw")
+Features
+```
+
+```{r}
+CVV<-10 # number of FOLDS for cross validation
+ree<-1 # number of repetitions 
+require(h2o)
+h2o.init(nthreads = -1)
+```
+
+## Gradient Boosting Machine
+
+### Function GBM
+
+10F-CV within the training dataset. 
+
+```{r}
+GBM<-function(tr,ts,tv,CV,re,delta,eti,pdtors,Outcome,Pheno){
+  #Factor for groupdata2 split. The package requires the ID to be a factor 
+  tr[,"ID"]<-as.factor(tr[,"ID"])
+  if(delta==1){tr<-Add_delta_variable(tr,Features,id="ID")
+  ts<-Add_delta_variable(ts,Features,id="ID")
+  tv<-Add_delta_variable(tv,Features,id="ID")
+  num<-"_YesDelta"
+  tr[is.na(tr)]=0#Baseline delta to 0 
+  ts[is.na(ts)]=0
+  tv[is.na(tv)]=0
+  
+  Predictors<-c(pdtors,colnames(tr)[grepl("Delta.",colnames(tr))])
+  }else{Predictors<-pdtors
+  num<-"_NoDeltas"}
+  
+  dff<-data.frame(Model=rep(NA,re),R_t=rep(NA,re),
+                  CI1_t=rep(NA,re),CI2_t=rep(NA,re),
+                  Pval_t=rep(NA,re),RMSE_t=rep(NA,re),
+                  MAE_t=rep(NA,re),R_v=rep(NA,re),
+                  CI1_v=rep(NA,re),CI2_v=rep(NA,re),
+                  Pval_v=rep(NA,re),RMSE_v=rep(NA,re),MAE_v=rep(NA,re))
+  folds_df<-as.data.frame(matrix(rep(NA,nrow(tr)*re),ncol = re))
+  colnames(folds_df)<-gsub("V","Repe_",colnames(folds_df)) 
+  tr$ID<-as.factor(as.character(tr$ID))
+  colN<-c(Predictors,Pheno,Outcome,".folds")
+  ts<-ts %>% arrange(ID,wave) %>% as.data.frame()
+  tr<-tr %>% arrange(ID,wave) %>% as.data.frame()
+  tv<-tv %>% arrange(ID,wave) %>% as.data.frame()
+  j<-1  
+  big_list<-list() 
+  
+  y <- "age_wk"
+  for (j in 1:re){ 
+    folds <- groupdata2::fold(tr, k = CV, id_col ="ID",
+                              cat_col = c('strain','cohort','sex'))
+    trainh2o2 <- as.h2o(folds[,colN])
+    x <- setdiff(setdiff(colnames(trainh2o2),y),".folds") 
+    Validate <- as.h2o(ts[,setdiff(colN,".folds")])
+    Validate2 <- as.h2o(tv[,setdiff(colN,".folds")])
+    folds_df[,j]<-as.vector(folds$.folds)
+    rm(folds)
+    model_id<-paste0(eti,num,"_Rep",j,"_N",format(Sys.time(), "%s"),collapse = "_")
+    model_folder<-paste0(patho,"Models/Model_Selection/Models_",eti,num,collapse = "_")
+    dl_model <- h2o.gbm(x = x,
+                        y = y,
+                        model_id = model_id,
+                        training_frame = trainh2o2,
+                        folds=10,#fold_column=".folds",  
+                        stopping_metric = "AUTO",
+                        keep_cross_validation_predictions = TRUE
+    )
+    Hematology_Based_Age_Test<-h2o.predict(object = dl_model, newdata =Validate)
+    Hematology_Based_Age_Test2<-h2o.predict(object = dl_model, newdata =Validate2)
+    Hematology_Based_Age_Test<-as.vector(Hematology_Based_Age_Test)
+    Hematology_Based_Age_Test2<-as.vector(Hematology_Based_Age_Test2)
+    
+    
+    r_test<-cor.test(Hematology_Based_Age_Test,ts$age_wk)
+    r_vdte<-cor.test(Hematology_Based_Age_Test2,tv$age_wk)
+    
+    dff[j,"Model"]<-model_id
+    dff[j,"R_t"]<-round(r_test$estimate,digit=2)
+    dff[j,"CI1_t"]<-round(r_test$conf.int[[1]],digit=2)
+    dff[j,"CI2_t"]<-round(r_test$conf.int[[2]],digit=2)
+    dff[j,"Pval_t"]<-round(r_test$p.value,digit=2)
+    dff[j,"RMSE_t"]<-round(rmse(ts$age_wk,Hematology_Based_Age_Test),digit=2)
+    dff[j,"MAE_t"]<-round(mae(ts$age_wk,Hematology_Based_Age_Test),digit=2)
+    dff[j,"R_v"]<-round(r_vdte$estimate,digit=2)
+    dff[j,"CI1_v"]<-round(r_vdte$conf.int[[1]],digit=2)
+    dff[j,"CI2_v"]<-round(r_vdte$conf.int[[2]],digit=2)
+    dff[j,"Pval_v"]<-round(r_vdte$p.value,digit=2)
+    dff[j,"RMSE_v"]<-round(rmse(tv$age_wk,Hematology_Based_Age_Test2),digit=2)
+    dff[j,"MAE_v"]<-round(mae(tv$age_wk,Hematology_Based_Age_Test2),digit=2)
+    if(!file.exists(model_folder)){dir.create(model_folder)}
+    mojo_destination <- h2o.save_mojo(dl_model, path = model_folder)
+    big_list[[j]] <- dl_model
+    names(big_list)[[j]] <- model_id
+    print(j)
+  }
+  assign(paste0("List_",model_id,sep=""),big_list, envir = globalenv())
+  assign(paste0("Results_",model_id,sep=""),dff, envir = globalenv())
+  assign(paste0("F10CV_",model_id,sep=""),folds_df, envir = globalenv())
+  return
+}
+
+```
+
+```{r,eval=FALSE}
+tra<-train %>% mutate(age_wk=round(age_wk,digits=0))
+tst<-validate2 %>% mutate(age_wk=round(age_wk,digits=0))
+tvt<-vald %>% mutate(age_wk=round(age_wk,digits=0))
+GBM(tr=tra,ts=tst,tv=tvt, CV=CVV,re=ree,
+    delta=0,
+    eti="GBM_ALL_GB_Blood",
+    pdtors=Features,
+    Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+## Generalized Linear Models (Gaussian)
+
+### Function GLM
+
+10F-CV within the training dataset. 
+
+```{r}
+GLM<-function(tr,ts,tv,CV,re,delta,eti,pdtors,Outcome,Pheno){
+  #Factor for groupdata2 split. The package requires the ID to be a factor 
+  tr[,"ID"]<-as.factor(tr[,"ID"])
+  if(delta==1){tr<-Add_delta_variable(tr,Features,id="ID")
+  num<-"_YesDelta"
+  tr[is.na(tr)]=0#Baseline delta to 0 
+  ts[is.na(ts)]=0
+  tv[is.na(tv)]=0
+  
+  Predictors<-c(pdtors,colnames(tr)[grepl("Delta.",colnames(tr))])
+  }else{Predictors<-pdtors
+  num<-"_NoDeltas"}
+  
+  dff<-data.frame(Model=rep(NA,re),R_t=rep(NA,re),
+                  CI1_t=rep(NA,re),CI2_t=rep(NA,re),
+                  Pval_t=rep(NA,re),RMSE_t=rep(NA,re),
+                  MAE_t=rep(NA,re),R_v=rep(NA,re),
+                  CI1_v=rep(NA,re),CI2_v=rep(NA,re),
+                  Pval_v=rep(NA,re),RMSE_v=rep(NA,re),MAE_v=rep(NA,re))
+  folds_df<-as.data.frame(matrix(rep(NA,nrow(tr)*re),ncol = re))
+  colnames(folds_df)<-gsub("V","Repe_",colnames(folds_df)) 
+  tr$ID<-as.factor(as.character(tr$ID))
+  colN<-c(Predictors,Pheno,Outcome,".folds")
+  ts<-ts %>% arrange(ID,wave) %>% as.data.frame()
+  tr<-tr %>% arrange(ID,wave) %>% as.data.frame()
+  tv<-tv %>% arrange(ID,wave) %>% as.data.frame()
+  j<-1  
+  big_list<-list() 
+  
+  y <- "age_wk"
+  for (j in 1:re){ 
+    folds <- groupdata2::fold(tr, k = CV, id_col ="ID",
+                              cat_col = c('strain','cohort','sex'))
+    folds$sex<-as.factor(folds$sex); ts$sex<-as.factor(ts$sex);
+    tv$sex<-as.factor(tv$sex)
+    trainh2o2 <- as.h2o(folds[,colN])
+    x <- setdiff(setdiff(colnames(trainh2o2),y),".folds") 
+    Validate <- as.h2o(ts[,setdiff(colN,".folds")])
+    Validate2 <- as.h2o(tv[,setdiff(colN,".folds")])
+    folds_df[,j]<-as.vector(folds$.folds)
+    rm(folds)
+    model_id<-paste0(eti,num,"_Rep",j,"_N",format(Sys.time(), "%s"),collapse = "_")
+    model_folder<-paste0(patho,"Models/Model_Selection/Models_",eti,num,collapse = "_")
+    dl_model <- h2o.glm(x = x,
+                        y = y,
+                        model_id = model_id,
+                        training_frame = trainh2o2,
+                        fold_column=".folds", 
+                        lambda_search = TRUE,
+                        generate_scoring_history = TRUE,
+                        keep_cross_validation_predictions = TRUE                             )
+    Hematology_Based_Age_Test<-h2o.predict(object = dl_model, newdata =Validate)
+    Hematology_Based_Age_Test2<-h2o.predict(object = dl_model, newdata =Validate2)
+    Hematology_Based_Age_Test<-as.vector(Hematology_Based_Age_Test)
+    Hematology_Based_Age_Test2<-as.vector(Hematology_Based_Age_Test2)
+    
+    
+    r_test<-cor.test(Hematology_Based_Age_Test,ts$age_wk)
+    r_vdte<-cor.test(Hematology_Based_Age_Test2,tv$age_wk)
+    
+    dff[j,"Model"]<-model_id
+    dff[j,"R_t"]<-round(r_test$estimate,digit=2)
+    dff[j,"CI1_t"]<-round(r_test$conf.int[[1]],digit=2)
+    dff[j,"CI2_t"]<-round(r_test$conf.int[[2]],digit=2)
+    dff[j,"Pval_t"]<-round(r_test$p.value,digit=2)
+    dff[j,"RMSE_t"]<-round(rmse(ts$age_wk,Hematology_Based_Age_Test),digit=2)
+    dff[j,"MAE_t"]<-round(mae(ts$age_wk,Hematology_Based_Age_Test),digit=2)
+    dff[j,"R_v"]<-round(r_vdte$estimate,digit=2)
+    dff[j,"CI1_v"]<-round(r_vdte$conf.int[[1]],digit=2)
+    dff[j,"CI2_v"]<-round(r_vdte$conf.int[[2]],digit=2)
+    dff[j,"Pval_v"]<-round(r_vdte$p.value,digit=2)
+    dff[j,"RMSE_v"]<-round(rmse(tv$age_wk,Hematology_Based_Age_Test2),digit=2)
+    dff[j,"MAE_v"]<-round(mae(tv$age_wk,Hematology_Based_Age_Test2),digit=2)
+    if(!file.exists(model_folder)){dir.create(model_folder)}
+    mojo_destination <- h2o.save_mojo(dl_model, path = model_folder)
+    big_list[[j]] <- dl_model
+    names(big_list)[[j]] <- model_id
+    print(j)
+  }
+  assign(paste0("List_",model_id,sep=""),big_list, envir = globalenv())
+  assign(paste0("Results_",model_id,sep=""),dff, envir = globalenv())
+  assign(paste0("F10CV_",model_id,sep=""),folds_df, envir = globalenv())
+  return
+}
+
+
+```
+
+```{r,eval=FALSE}
+GLM(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+    delta=0,
+    eti="GLM_ALL_GB_Blood",
+    pdtors=Features,
+    Outcome="age_wk",Pheno=c("sex","strain"))
+
+
+```
+
+## Deep Neural Network
+
+### Function DNN
+
+10F-CV within the training dataset. 
+
+```{r}
+DNN<-function(tr,ts,tv,CV,re,delta,eti,pdtors,Outcome,Pheno){
+  #Factor for groupdata2 split. The package requires the ID to be a factor 
+  tr[,"ID"]<-as.factor(tr[,"ID"])
+  if(delta==1){tr<-Add_delta_variable(tr,Features,id="ID")
+  ts<-Add_delta_variable(ts,Features,id="ID")
+  tv<-Add_delta_variable(tv,Features,id="ID")
+  num<-"_YesDelta"
+  tr[is.na(tr)]=0#Baseline delta to 0 
+  ts[is.na(ts)]=0
+  tv[is.na(tv)]=0
+  
+  Predictors<-c(pdtors,colnames(tr)[grepl("Delta.",colnames(tr))])
+  }else{Predictors<-pdtors
+  num<-"_NoDeltas"}
+  
+  dff<-data.frame(Model=rep(NA,re),R_t=rep(NA,re),
+                  CI1_t=rep(NA,re),CI2_t=rep(NA,re),
+                  Pval_t=rep(NA,re),RMSE_t=rep(NA,re),
+                  MAE_t=rep(NA,re),R_v=rep(NA,re),
+                  CI1_v=rep(NA,re),CI2_v=rep(NA,re),
+                  Pval_v=rep(NA,re),RMSE_v=rep(NA,re),MAE_v=rep(NA,re))
+  
+  folds_df<-as.data.frame(matrix(rep(NA,nrow(tr)*re),ncol = re))
+  colnames(folds_df)<-gsub("V","Repe_",colnames(folds_df)) 
+  tr$ID<-as.factor(as.character(tr$ID))
+  colN<-c(Predictors,Pheno,Outcome,".folds")
+  ts<-ts %>% arrange(ID,wave) %>% as.data.frame()
+  tr<-tr %>% arrange(ID,wave) %>% as.data.frame()
+  tv<-tv %>% arrange(ID,wave) %>% as.data.frame()
+  j<-1  
+  big_list<-list() 
+  
+  y <- "age_wk"
+  for (j in 1:re){ 
+    folds <- groupdata2::fold(tr, k = CV, id_col ="ID",
+                              cat_col = c('strain','cohort','sex'))
+    folds$sex<-as.factor(folds$sex); ts$sex<-as.factor(ts$sex);tv$sex<-as.factor(tv$sex)
+    trainh2o2 <- as.h2o(folds[,colN])
+    x <- setdiff(setdiff(colnames(trainh2o2),y),".folds") 
+    Validate <- as.h2o(ts[,setdiff(colN,".folds")])
+    Validate2 <- as.h2o(tv[,setdiff(colN,".folds")])
+    folds_df[,j]<-as.vector(folds$.folds)
+    rm(folds)
+    model_id<-paste0(eti,num,"_Rep",j,"_N",format(Sys.time(), "%s"),collapse = "_")
+    model_folder<-paste0(patho,"Models/Model_Selection/Models_",eti,num,collapse = "_")
+    dl_model <- h2o.deeplearning(x = x,
+                                 y = y,
+                                 model_id = model_id,
+                                 training_frame = trainh2o2,
+                                 fold_column=".folds",  
+                                 activation = "RectifierWithDropout",
+                                 score_each_iteration = TRUE,
+                                 stopping_metric = "AUTO",
+                                 stopping_tolerance = 1e-02,
+                                 stopping_rounds = 3,
+                                 keep_cross_validation_predictions = TRUE,
+                                 variable_importances = TRUE,
+                                 export_weights_and_biases = TRUE
+    )
+    Hematology_Based_Age_Test<-h2o.predict(object = dl_model, newdata =Validate)
+    Hematology_Based_Age_Test2<-h2o.predict(object = dl_model, newdata =Validate2)
+    Hematology_Based_Age_Test<-as.vector(Hematology_Based_Age_Test)
+    Hematology_Based_Age_Test2<-as.vector(Hematology_Based_Age_Test2)
+    
+    
+    r_test<-cor.test(Hematology_Based_Age_Test,ts$age_wk)
+    r_vdte<-cor.test(Hematology_Based_Age_Test2,tv$age_wk)
+    
+    dff[j,"Model"]<-model_id
+    dff[j,"R_t"]<-round(r_test$estimate,digit=2)
+    dff[j,"CI1_t"]<-round(r_test$conf.int[[1]],digit=2)
+    dff[j,"CI2_t"]<-round(r_test$conf.int[[2]],digit=2)
+    dff[j,"Pval_t"]<-round(r_test$p.value,digit=2)
+    dff[j,"RMSE_t"]<-round(rmse(ts$age_wk,Hematology_Based_Age_Test),digit=2)
+    dff[j,"MAE_t"]<-round(mae(ts$age_wk,Hematology_Based_Age_Test),digit=2)
+    dff[j,"R_v"]<-round(r_vdte$estimate,digit=2)
+    dff[j,"CI1_v"]<-round(r_vdte$conf.int[[1]],digit=2)
+    dff[j,"CI2_v"]<-round(r_vdte$conf.int[[2]],digit=2)
+    dff[j,"Pval_v"]<-round(r_vdte$p.value,digit=2)
+    dff[j,"RMSE_v"]<-round(rmse(tv$age_wk,Hematology_Based_Age_Test2),digit=2)
+    dff[j,"MAE_v"]<-round(mae(tv$age_wk,Hematology_Based_Age_Test2),digit=2)
+    if(!file.exists(model_folder)){dir.create(model_folder)}
+    mojo_destination <- h2o.save_mojo(dl_model, path = model_folder)
+    big_list[[j]] <- dl_model
+    names(big_list)[[j]] <- model_id
+    print(j)
+  }
+  assign(paste0("List_",model_id,sep=""),big_list, envir = globalenv())
+  assign(paste0("Results_",model_id,sep=""),dff, envir = globalenv())
+  assign(paste0("F10CV_",model_id,sep=""),folds_df, envir = globalenv())
+  return
+}
+```
+
+```{r,eval=FALSE}
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+    delta=0,
+    eti="DNN_ALL_GB_Blood",
+    pdtors=Features,
+    Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+
+```{r,eval = FALSE}
+#Manually cache
+save.image(paste0(patho,"Tables/Output/GBM_GLM_DNN_model_selection.RData"))
+```
+
+
+```{r,eval = TRUE}
+load(paste0(patho,"Tables/Output/GBM_GLM_DNN_model_selection.RData",sep=""))
+```
+
+## Results 
+
+### GBM
+
+#### 10FCV
+
+```{r}
+List_GBM_ALL_GB_Blood_NoDeltas_Rep1_N1692292295[["GBM_ALL_GB_Blood_NoDeltas_Rep1_N1692292295"]]@model[["cross_validation_metrics"]]
+```
+```{r}
+sqrt(h2o.r2(List_GBM_ALL_GB_Blood_NoDeltas_Rep1_N1692292295[["GBM_ALL_GB_Blood_NoDeltas_Rep1_N1692292295"]]))
+```
+            
+
+
+### GLM
+
+#### 10FCV
+
+```{r}
+List_GLM_ALL_GB_Blood_NoDeltas_Rep1_N1692292347[["GLM_ALL_GB_Blood_NoDeltas_Rep1_N1692292347"]]@model[["cross_validation_metrics"]]
+```
+
+
+### DNN
+#### 10FCV
+
+```{r}
+List_DNN_ALL_GB_Blood_NoDeltas_Rep1_N1692292418[["DNN_ALL_GB_Blood_NoDeltas_Rep1_N1692292418"]]@model[["cross_validation_metrics"]]
+```
+
+
+### DNN + Longitudinal information
+#### Function to add chronological information 
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+```{r}
+sqrt(h2o.r2(List_DNN_ALL_GB_Blood_NoDeltas_Rep1_N1692292418[["DNN_ALL_GB_Blood_NoDeltas_Rep1_N1692292418"]]))
+```
+
+
+Example of deltas
+```{r}
+Z<-Add_delta_variable(train,Features)
+Z<-Z %>% select(ID,age_wk,rbc,Delta.rbc) %>% head(10)
+kable(Z)%>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+
+
+```{r,eval=FALSE}
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+    delta=1,
+    eti="DNN_ALL_GB_Blood",
+    pdtors=Features,
+    Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+```{r}
+sqrt(h2o.r2(List_DNN_ALL_GB_Blood_YesDelta_Rep1_N1692292720[["DNN_ALL_GB_Blood_YesDelta_Rep1_N1692292720"]]))
+```
+```{r}
+List_DNN_ALL_GB_Blood_YesDelta_Rep1_N1692292720[["DNN_ALL_GB_Blood_YesDelta_Rep1_N1692292720"]]@model[["cross_validation_metrics"]]
+```
+
+
+```{r,eval = FALSE}
+ss<-paste0(patho,"Tables/GBM_GLM_DNN_model_selection.Rdata",format(Sys.time(), "%s"),".RData")
+save.image(ss)
+```
+
+
+### Plots
+```{r}
+C_plot <- as.h2o(train)
+predictions<-as.data.frame(train[,"age_wk"])  
+colnames(predictions)<-"Chronological Age"
+
+pat<-paste0(patho,"Models/Model_Selection/Models_GLM_ALL_GB_Blood_NoDeltas/GLM_ALL_GB_Blood_NoDeltas_Rep1_N1692292347.zip", sep="")
+imported_model <- h2o.import_mojo(pat)
+bl<-h2o.predict(object = imported_model, newdata =C_plot)
+predictions$`Blood Age (GLM)`<-as.vector(round(bl,digit=2))
+pat<-paste0(patho,"Models/Model_Selection/Models_GBM_ALL_GB_Blood_NoDeltas/GBM_ALL_GB_Blood_NoDeltas_Rep1_N1692292295.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+bl<-h2o.predict(object = imported_model, newdata =C_plot)
+predictions$`Blood Age (GBM)`<-as.vector(round(bl,digit=2))
+pat<-paste0(patho,"Models/Model_Selection/Models_DNN_ALL_GB_Blood_NoDeltas/DNN_ALL_GB_Blood_NoDeltas_Rep1_N1692292418.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+bl<-h2o.predict(object = imported_model, newdata =C_plot)
+predictions$`Blood Age (DNN)`<-as.vector(round(bl,digit=2))
+mel<-reshape2::melt(predictions)
+p<-ggplot(mel, aes(x=value, color=variable)) +
+  theme_linedraw()+
+  geom_density(size=1)+
+  theme(legend.position="bottom")
+p<-p+theme(legend.text = element_text(size = 5))
+
+ggsave(paste0(patho,"Plots/Densities2.tiff"),
+p, device = "tiff",width = 12, height = 6,
+  units = c("cm"), dpi = 450)
+```
+
+

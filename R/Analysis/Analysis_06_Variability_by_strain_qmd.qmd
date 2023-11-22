@@ -1,0 +1,171 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "ICC"
+
+author: "Jorge Martinez-Romero"
+date: "2023-07-28"
+format: html 
+toc: true   
+self-contained: true  
+---
+
+## DATA ANALYSIS (VARIABILITY)
+GOAL: Determine predictor variability to check if higher variability in blood components corresponds to better clock predictions. 
+STRATEGY: Intraclass correlation coefficient (ICC) analysis.
+To maintain the longitudinal structure comparable, the SLAM dataset will be filtered to include only the three overlapping timepoints present in the JAX study (blood samples collected at 12, 18, and 24 months of age). 
+To compare similar population sizes and, multiple sampling (1000i) composed of ~70% of SLAM samples (approximately the same size as the JAX dataset) will be performed and the results averaged.
+The calculations will be done in harmonized datasets after batch effect removal.
+
+```{r setup, include=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_Clock_2023_Git/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+
+
+```{r libraries, echo=FALSE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("dplyr")
+library("groupdata2")
+library("lme4")
+library("jtools")
+library("kableExtra")
+```
+
+## Retrieve data
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+rm(pa)
+```
+
+
+```{r Retrieve Advia}
+data_all<-rbind(train,vald,validate2)
+
+SH <-data_all %>% filter(strain=="HET3",age_wk>=31 & age_wk<=82,) %>% select(ID, age_wk, sex,strain,cohort,Features,) %>% filter(complete.cases(.))
+SB <-data_all %>% filter(strain=="B6",age_wk>=31 & age_wk<=82,) %>% select(ID, age_wk, sex,strain,cohort,Features,) %>% filter(complete.cases(.))
+JD <-data_all %>% filter(strain=="DO") %>% select(ID, age_wk, sex,strain,cohort,Features,) %>% filter(complete.cases(.))
+```
+
+## Calculate ICC in harmonized cohort
+
+#### DO mice
+```{r}
+#DO
+j<-1
+
+daf<-JD[,c(Features,"sex","age_wk","ID")]
+daf$ID<-as.factor(daf$ID)
+nn<-length(Features)
+ICC_DO <- matrix(rep(0,nn),ncol=1)
+rownames(ICC_DO)<-Features;colnames(ICC_DO)<-"ICC_DO"
+for (j in 1:length(Features)){
+  predictor<-with(daf,get(Features[j]))
+  mod1<-lmer(predictor ~ sex + age_wk+(1|ID),daf,REML=FALSE)#model
+  aa<-summary(mod1)
+  #ICC random intercept
+  ICC_DO[j,1]<-data.frame(aa$varcor)[1,4]/sum(data.frame(aa$varcor)[,4])
+}
+
+```
+
+
+
+#### Boot strapping SLAM mice
+To account for sample variability since JAX size is
+smaller than SLAM 
+#### HET3
+```{r}
+#HET3
+boots<-1000
+data<-SH[,c(Features,"sex","age_wk","ID")]
+data$ID<-as.factor(data$ID)
+nn<-length(Features)*boots
+ICC_H3 <- matrix(rep(0,nn),ncol=boots)
+rownames(ICC_H3)<-Features
+
+# JAX dataset is aprox. 69% SLAM size.
+# Perform 100 re sampling with re position and determine ICC (inter animal variation since 
+# cohort effect has been previously harmonized)
+
+for (i in 1:boots){ 
+  daf<-partition(
+    data,
+    p = 0.69,#DO sample is about 69% HET3 or B6 
+    cat_col = "sex",
+    id_col = "ID",
+  )[[1]]
+  
+  #calculate ICC for that 69% SLAM sample and store value
+  for (j in 1:length(Features)){
+    predictor<-with(daf,get(Features[j]))
+    mod1<-lmer(predictor ~ sex + age_wk+(1|ID),daf,REML=FALSE)#model
+    aa<-summary(mod1)
+    #ICC random intercept
+    ICC_H3[j,i]<-data.frame(aa$varcor)[1,4]/sum(data.frame(aa$varcor)[,4])
+  }
+}
+```
+
+#### B6
+```{r}
+boots<-100
+data<-SB[,c(Features,"sex","age_wk","ID")]
+data$ID<-as.factor(data$ID)
+nn<-length(Features)*boots
+ICC_B6 <- matrix(rep(0,nn),ncol=boots)
+rownames(ICC_B6)<-Features
+i<-1
+for (i in 1:boots){ 
+  daf<-partition(
+    data,
+    p = 0.69,
+    cat_col = "sex",
+    id_col = "ID",
+)[[1]]
+  
+  for (j in 1:length(Features)){
+    predictor<-with(daf,get(Features[j]))
+    mod1<-lmer(predictor ~ sex +age_wk+(1|ID),daf,REML=FALSE)#model
+    aa<-summary(mod1)
+    #ICC random intercept
+    ICC_B6[j,i]<-data.frame(aa$varcor)[1,4]/sum(data.frame(aa$varcor)[,4])
+  }
+}
+```
+
+
+## Results
+Generate Table mean values for the bootstrapping
+```{r}
+B6_mean2<-data.frame(apply(ICC_B6,1,mean))
+B6_SD2<-data.frame(apply(ICC_B6,1,sd))
+H3_mean2<-data.frame(apply(ICC_H3,1,mean))
+H3_SD2<-data.frame(apply(ICC_H3,1,sd))
+
+
+Table_final2<-cbind(B6_mean2,B6_SD2,H3_mean2,H3_SD2,ICC_DO)
+
+colnames(Table_final2)[1:4]<-c("ICC_B6","B6_SD","ICC_H3","H3_SD")
+Table_final2<-tibble::rownames_to_column(Table_final2) %>% mutate_if(is.numeric,round, digit=3) 
+Table_final_ICC<-Table_final2 %>% mutate(DOvsH3=ifelse(is.infinite(ICC_DO/ICC_H3),">10e6",round(ICC_DO/ICC_H3,digit=3)),
+                                         DOvsB6=ifelse(is.infinite(ICC_DO/ICC_B6),">10e6",round(ICC_DO/ICC_B6,digit=3)),
+                                         H3vsB6=ifelse(is.infinite(ICC_H3/ICC_B6),">10e6",round(ICC_H3/ICC_B6,digit=3)))
+rm(Table_final2)
+kable(Table_final_ICC) %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+write.csv(Table_final_ICC,paste0(patho,"Tables/Output/Table_final_ICC.csv",sep=""))
+```
+
+```{r,eval=FALSE}
+save.image(paste0(patho,"Tables/Output/ICC_Raw_dataset.RData",sep=""))
+```
+
+```{r,eval=True}
+load(paste0(patho,"Tables/Output/ICC_Raw_dataset.RData",sep=""))
+```
+
+

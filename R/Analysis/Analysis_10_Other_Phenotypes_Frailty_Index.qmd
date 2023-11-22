@@ -1,0 +1,742 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
+
+author: "Jorge Martinez-Romero"
+date: "2023-09-28"
+format: html 
+params:
+  sex: "All" # "F", "M", "All". 
+  strain: "All" # "B6", "HET3", "DO", "All"
+  method: "differences" # Calculate age acceleration as the "differences" between predicted age and chronological age or as "residuals" after regresing predicted age on chronological age using a non linear regresssion
+  dataset: "All" #Select the dataset in where to perform analyses: "All","vald","validate2", "All_held_out","train"
+toc: true   
+self-contained: true  
+---
+
+
+## RELATIONSHIP ACC and OTHER PHENOTYPES: 
+Goal: Determine eventual association between age acceleration and other phenotypes.
+1) Frailty index on those animals with both blood samples and frailty analyses. 
+2) Body Weight (Not appropriate analysis because BW is a feature already used in the DNN to calculate acceleration)
+
+***
+```{r setup, include=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_Clock_2023/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+## Parameters
+### Parameter explanation.
+- sex: "F".  Select sex: "F", "M", "All".
+- strain: "All".  Select strain: "B6", "HET3", "DO", "All".
+- method: "differences".  Calculate age acceleration as:.
+  - "differences" between predicted age and chronological age or as
+  - "residuals" after regressing predicted age on chronological age
+    using a non linear loess.
+- dataset: "All". Select the dataset in where to perform analyses:
+    "All", "Vald" (Cohort C07 G08) "Validate2" (Pool of cohorts), "All_held_out" (Includes all samples held out during the training process [Vald + Validate2]), "train" (Training set only).
+    
+```{r libraries, echo=TRUE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("ggplot2")
+library("tidyverse")
+library("dplyr")
+library("survival") 
+library("Metrics")
+library("h2o")
+library("data.table")
+library("Metrics")
+library("eha")
+library("kableExtra")
+library("quantreg")
+library("exact2x2")
+library("utils")
+library("LaplacesDemon")
+library("lme4")
+library("DT")
+library("splines")
+
+```
+
+###  Retrieve data and predict
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+rm(pa,pat)
+Survival_CMS <- read_csv(paste(patho,"Tables/Source/survival_detailed_2023-07-25.csv",sep=""),col_types = cols(cohort = col_factor(levels = c("1",
+"2", "3", "4", "5", "6", "7", "8",
+"9", "10")), sex = col_factor(levels = c("F",
+"M")), strain = col_factor(levels = c("B6",
+"HET3")), tod = col_date(format = "%m/%d/%Y"),
+dob = col_date(format = "%m/%d/%Y"),
+dead_censor_nat = col_factor(levels = c("0",
+"1"))))
+#filter animals cohort 1-10 and natural death
+CMS<-Survival_CMS %>% mutate(ID=as.factor(paste0("C",idno,dif="")),
+                             lifespan=age_wk) %>% 
+                              select("ID","project","cohort","lifespan",
+                                     "cod","sex","strain","dead_censor_nat") %>% 
+                                filter(project=="SLAM"& !is.na(cohort) & dead_censor_nat==1) %>% as.data.frame()
+```
+
+Update survival after final diagnosis by NIA-NIH veterinarians (CMS)
+
+```{r}
+update_mortality<-function(df){
+      #merge the Advia dataset with CMS-> NAs for non natural death
+      df <- df %>%
+      left_join(., CMS, by = "ID") 
+      #Build a natural death censor with same values for JAX 
+      df<-df %>% mutate(
+      final_lifespan= ifelse(strain.x=="DO",lifespan.x,lifespan.y))
+      #Build a lifespan variable with same values for JAX
+      df <- df %>% mutate(
+      final_natural_death=ifelse(strain.x=="DO",natural_death,natural_death))
+      #Update natural death censor and lifespan according to final NIA-CMS veterinarian report
+      df <- df %>% mutate(#Correct lifespan as per NIH-CMS  
+      final_lifespan= ifelse(strain.x!="DO"& is.na(dead_censor_nat),
+                             lifespan.x,final_lifespan))
+      df<-df %>% mutate(# Censor animals not in NIH-CMS natural death
+      final_natural_death=ifelse(is.na(final_natural_death),
+                                 0,final_natural_death))  
+      df<-df %>% select(!c("project.y","dead_censor_nat","cohort.y","lifespan.y","cod","sex.y","strain.y")) %>% filter(final_lifespan!=0)
+      namess<-gsub("\\.x","",colnames(df))
+      colnames(df)<-namess
+      df$strain=as.factor(df$strain)
+      df$sex=as.factor(df$sex)
+      df$cohort=as.factor(df$cohort)
+      df$ID=as.factor(as.character(df$ID))
+#Two records with no CMS identification in Advia. From 12.010 to 12.008 observations      
+      return(df)
+}
+```
+
+```{r}
+train<-update_mortality(train)
+validate2<-update_mortality(validate2)
+vald<-update_mortality(vald)
+
+#aa<-df %>% select(ID,strain,lifespan,final_lifespan,natural_death,final_natural_death) %>% mutate(
+ # dif=lifespan-final_lifespan,dif2= natural_death-final_natural_death)
+```
+
+1)  Function add deltas
+
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+#### Select features to add delta (No categoricals)
+
+```{r}
+Features<-c("rbc","mcv","mchc","mch","chcm","p.lym"  
+,"wbc","plt","glucose","bw")
+```
+
+------------------------------------------------------------------------
+
+```{r}
+Features
+```
+
+------------------------------------------------------------------------
+
+#### Load best DNN after tuning
+
+```{r, echo=TRUE}
+library(h2o)
+h2o.init()
+pat<-paste0(patho,"Models/Models_tunning/DNN_blood_62_N1691016783.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+
+```
+
+#### Predict biological age using the best DNN tuned
+#### and calculate age acceleration
+
+```{r}
+train$dataset<-"train"
+validate2$dataset<-"validate2"
+vald$dataset<-"vald"
+data_all<-rbind(train,validate2,vald)
+data_all<-Add_delta_variable(data_all,Features,id="ID")
+Validate <- as.h2o(data_all)
+Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+    Hematology_Based_Age<-as.vector(round(Hematology_Based_Age,digit=0))
+data_all$predicted_age<-Hematology_Based_Age 
+```
+
+Select Dataset to run the analysis according to parameter params$dataset
+
+```{r,warning=FALSE}
+
+  if(params$dataset == "All_held_out"){
+    data_all<-data_all[data_all$dataset!="train",]}
+  if(params$dataset == "train"){
+    data_all<-data_all[data_all$dataset=="train",]}
+  if(params$dataset == "vald"){
+    data_all<-data_all[data_all$dataset=="vald",]}
+ if(params$dataset == "validate2"){
+    data_all<-data_all[data_all$dataset=="validate2",]}
+```
+
+Select the sex and the strain according to the parameters sex and strain
+
+```{r,warning=FALSE}
+if(params$sex != "All"){
+ data_all<-data_all %>% filter(sex==params$sex)
+ CMS<-CMS %>% filter(sex==params$sex)
+ Sx<-unique(as.character(train$sex))
+cat("Sex = ", Sx)
+}
+```
+
+```{r,warning=FALSE}
+data_do<-data_all
+if(params$strain != "All"){
+ data_all<-data_all %>% filter(strain==params$strain)
+ CMS<-CMS %>% filter(strain==params$strain)
+ St<-unique(as.character(train$strain))
+ cat("Strain = ", St)
+ }else{data_all<-data_all %>% filter(strain!="DO")} #Only SLAM
+
+```
+
+```{r}
+if(params$strain == "All"){St<-"All"}
+if(params$sex == "All"){Sx<-"All"}
+if(params$dataset == "All"){Sv<-"All"}
+if(params$dataset == "All_held_out"){Sv<-"All_held_out"}
+
+```
+
+
+### Frailty index Analysis
+Goal: Determine eventual association between age acceleration and Frailty index on those animals with both blood samples and frailty analyses 
+
+Import Frailty dataset
+```{r}
+library("ggplot2")
+FI<-read.csv(paste0(patho,"Tables/Source/Frailty_Index_scored_detailed_BW_midlife_2023-08-29_long.csv"))
+above<-50
+bellow<-160
+cohorts<-c("11","12","13","14")#remove not SLAM cohorts
+```
+
+
+```{r}
+FI$ID<-paste0("C",FI$idno)#filter varaibles of interest
+FI<-FI %>% select("ID",
+                  "FI","bw","sex","strain","dob","date","cohort","Operator",
+                  "age_wk") %>% filter(age_wk>=above & age_wk<bellow)
+```
+
+
+```{r}
+FI <- FI[!(FI$cohort %in% cohorts),] %>% filter(bw>0)
+FI$Operator<-as.factor(FI$Operator)
+
+
+FIplot<-ggplot(data = FI, aes(x = age_wk, y = FI))+
+  geom_point( alpha = .2, size=1.5,col="pink3")+
+  theme_minimal()+
+  geom_smooth(method = "loess", span=0.85, col="darkblue")+
+  labs(title = "Frailty Index trough lifespan (SLAM cohort)")+
+  scale_color_manual("Blood Acceleration\nGroup",values=c("Red","Dark green"))+
+  xlab("\nChronological age (weeks)")+ 
+  ylab("Frailty Index \n")+theme_minimal()+
+  theme(
+    panel.grid = element_blank(),
+    panel.grid.major = element_line(color = "black", size = 0.02), 
+    panel.grid.minor= element_line(color = "black", size = 0.02),
+    panel.background = element_rect(fill = "white")
+    )
+
+cor.test(FI$FI,FI$age_wk
+         )
+```
+
+```{r}
+FIplot
+```
+```{r}
+ggsave(paste0(patho,"Plots/FI_plot_",params$dataset,".tiff",sep=""),
+FIplot, device = "tiff",width = 12, height = 9,
+  units = c("cm"), dpi = 400)
+```
+
+
+### Remove cohort effect and operator effect from FI
+LMM Models
+
+```{r}
+df<-FI
+mo<-lmer(FI~ sex + strain + (age_wk|Operator) +(1|ID) + (age_wk|cohort),  FI)
+summary(mo)
+```
+
+
+Extract intercept and slope per cohort and operator and subtract estimates.
+```{r}
+rand_eff<-ranef(mo)
+Oper<-rand_eff$Operator %>% as.data.frame()
+colnames(Oper)<-c("Intcp_Oper","Slp_Oper")
+Oper$Operator <- rownames(Oper)
+Coh<-rand_eff$cohort 
+colnames(Coh)<-c("Intcp_Coh","Slp_Coh")
+Coh$cohort <- as.numeric(rownames(Coh))
+
+FI<-FI %>% left_join(Oper, by=c("Operator")) %>% 
+                        left_join(Coh, by=c("cohort"))
+
+FI$FI_BER<-with(FI,FI-Intcp_Coh-Intcp_Oper-(Slp_Oper*age_wk)-(Slp_Coh*age_wk))
+```
+
+Check effect removal (INTERCEPTS)
+```{r}
+moBER<-lmer(FI_BER~ sex +strain + (1|ID) + (1|cohort)+(1|Operator), FI)
+summary(moBER)
+```
+Check effect removal 2 (SLOPES)
+```{r}
+mo2<-lmer(FI_BER~ sex + strain + (age_wk|Operator) +(1|ID) + (age_wk|cohort), FI)
+summary(mo2)
+```
+
+
+
+#### Merge FI to Blood dataset (By age and ID)
+
+```{r}
+Blood<-data_all %>% select(ID, sex, strain,cohort,final_lifespan,final_natural_death,Features,predicted_age,age_wk)
+#Refactorize for modeling stratified
+Blood$cohort<-as.factor(as.character(Blood$cohort))
+Blood$strain<-as.factor(as.character(Blood$strain))
+Blood$sex<-as.factor(as.character(Blood$sex))
+Blood$ID<-as.factor(as.character(Blood$ID))
+#str(Blood)
+```
+
+
+
+```{r }
+Blood$months<-round((Blood$age_wk/4.5),digit=0)#to months
+FI$months<-round((FI$age_wk/4.5),digit=0)
+```
+
+
+Ages in months in FI
+
+```{r }
+sort(unique(FI$months))
+```
+
+Ages in months in Advia
+```{r}
+sort(unique(Blood$months))
+```
+
+Categorize age FI not present in Advia to the closest month present in Advia
+
+FI Age
+13->12
+16->15
+22->21
+28->27
+30->29
+31->32
+33->32
+
+```{r}
+
+FI<-FI %>% 
+  mutate(months_cat = case_when(
+    months == 13 ~ 12,
+    months == 16 ~ 15,
+    months == 22 ~ 21,
+    months == 28 ~ 27,
+    months == 30 ~ 29,
+    months == 31 ~ 32,
+    months == 33 ~ 32,
+    TRUE ~ months))
+
+```
+
+```{r }
+sort(unique(FI$months_cat))
+```
+
+Ages in months in Advia
+```{r}
+sort(unique(Blood$month))
+```
+
+Build and key ID+age in months to merge FI and blood datasets
+```{r}
+Blood$index_Age<-paste0(Blood$ID,"_",as.character(Blood$month)
+                               , sep="_")
+
+FI$index_Age<-paste0(FI$ID,"_",as.character(FI$months_cat), sep="_")
+```
+
+Merge datasets by ID+Age in dataset BI
+```{r}
+AAA<-FI[match(Blood$index_Age,FI$index_Age),]
+AAA<-AAA %>% select("Operator","FI_BER")
+BI<-cbind(Blood,AAA)
+BI<-BI[complete.cases(BI),] %>% filter(FI_BER>0);rm(AAA)
+```
+
+Calculate acceleration depending on the method selected in params 
+```{r}
+if(params$method=="residuals"){
+  model_loess <- loess(predicted_age~age_wk,BI)
+  BI<-BI%>% tidyr::drop_na() %>% mutate(Acceleration=round(model_loess$residuals,digits=1))
+}else{
+  BI<-BI %>% tidyr::drop_na() %>% mutate(Acceleration=round(predicted_age-age_wk,digits=1))}
+```
+
+#### Plot Acceleration 
+
+```{r}
+FIplot2<-ggplot(data = BI, aes(y = scale(Acceleration), x = FI_BER))+
+  geom_point( alpha = .3, size=3,col="brown")+
+  theme_minimal()+
+  theme(
+    panel.grid = element_blank(),
+    panel.grid.major = element_line(color = "black", size = 0.02), 
+    panel.grid.minor= element_line(color = "black", size = 0.02),
+    panel.background = element_rect(fill = "white")
+    )+
+  geom_smooth(method = "loess", span=0.9999, col="darkblue")+
+  labs(title = "Relationship Frailty Index - Acceleration",subtitle = paste0(dim(BI)[1]," mice (blood test and FI)",sep=""))+
+  scale_color_manual("Blood Acceleration\nGroup",values=c("Red","Dark green"))+
+  xlab("\nFrailty Index")+ 
+  ylab("Acceleration (scaled) \n")
+  
+FIplot2
+```
+
+
+
+```{r}
+FI_by_sex<-FIplot2+facet_wrap(~sex)
+FI_by_strain<-FIplot2+facet_wrap(~strain)
+```
+
+
+```{r}
+ggsave(paste0(patho,"Plots/FI_plot_Acc_FI_",params$dataset,".tiff",sep=""),
+FIplot2, device = "tiff",width = 12, height = 9,
+  units = c("cm"), dpi = 450)
+
+ggsave(paste0(patho,"Plots/FI_plot_Acc_FI_sex",params$dataset,".tiff",sep=""),
+FI_by_sex, device = "tiff",width = 12, height = 9,
+  units = c("cm"), dpi = 450)
+
+ggsave(paste0(patho,"Plots/FI_plot_Acc_FI_strain",params$dataset,".tiff",sep=""),
+FI_by_strain, device = "tiff",width = 12, height = 9,
+  units = c("cm"), dpi = 450)
+
+
+```
+### Association between acceleration and FI
+#### LMM Models. 
+##### Determine minimal adequate model by backward elimination.
+Maximal model
+```{r}
+df<-BI
+df$FI_logit<-logit(df$FI_BER)# transform percentage to logit
+
+mo<-lmer(scale(FI_logit)~scale(Acceleration) *sex*strain*scale(age_wk)+(1|ID), REML=FALSE, df)
+summary(mo)
+```
+Remove non significant 4 way interactions
+```{r}
+mo1<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)*sex*scale(age_wk)+strain+(1|ID), REML = FALSE,df)
+summary(mo1)
+```
+```{r}
+anova(mo,mo1)
+```
+P > 0.05: No significant difference between models.
+It is justified to simplify the model.
+
+Remove interactions
+```{r}
+mo2<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+sex+strain+scale(age_wk)+(1|ID), REML = FALSE,df)
+summary(mo2)
+```
+
+```{r}
+anova(mo1,mo2)
+```
+
+Simplification Justified
+
+Remove non significant highly correlated (r=0.84) age and compare models
+```{r}
+mo2<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+sex+strain+(1|ID), REML = FALSE,df)
+summary(mo2)
+```
+Compare with and without age:
+```{r}
+anova(mo1,mo2)
+```
+P > 0.05: No significant difference between models.
+It is justified to simplify the model.
+
+Repeat the process with strain:
+Remove non significant strain and compare models.
+
+```{r}
+mo3<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+sex+(1|ID), REML = FALSE,df)
+summary(mo3)
+```
+
+
+Models with and without strain as a predictor
+```{r}
+anova(mo2,mo3)
+```
+P > 0.05: No significant difference between models.
+It is justified to simplify the model.
+
+#### Minimal Adequate Model
+
+```{r}
+mo4<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+ sex+(1|ID), REML=FALSE, df )
+summary(mo4)
+```
+
+The LMM, after batch effect and operator effect correction, detects association between FI and Blood-revealed-age-acceleration (t=3.28, pval=0.001).
+
+***
+
+#### Second approach: Piecewise regression
+Include a knot at top of curve to compare regression with piece-wise regression
+
+Strategy: Find maximun in the acceleration curve and split the regression into two. Acceleration up to the maximum and the acceleration after the maximum (less number of observations with FI). Two regressions, four estimates
+Find the maximum fitting a lm that minimizes the residual std error (scaled Acceleration)
+
+Possible breaking points
+```{r}
+Break_FI<-round(df$FI_BER,digits=2)
+length(table(Break_FI))
+
+```
+
+31 points in where to break FI; Lets remove 3 point on each tail
+
+```{r}
+Break<-sort(unique(Break_FI))[2:30]
+Break
+```
+
+Find the model that minimize std error splitin on each break
+```{r}
+d<-numeric(29)
+df$FI<-
+for (i in 1:29){
+    model_breaks<-
+    lm(scale(Acceleration)~(FI_BER< Break[i])*FI_BER +
+     (FI_BER>= Break[i])*FI_BER, df)
+  d[i]<-summary(model_breaks)[[6]]  #Store the std error of 29 regressions
+}
+```
+
+
+```{r}
+#Select the point in where std error is minimal and break FI there
+FI_break<-Break[which(d==min(d))]
+cat("FI where std error is minimun:", FI_break, "FI_logit", logit(FI_break))
+```
+
+Fit a LMM considering the knot in -2.313635 previously calculated 
+extract pval
+```{r}
+#Spline
+library(splines)
+mo4_p<-lmerTest::lmer(Acceleration~ns(FI_logit,knots = -2.313635)+ sex+(1|ID), REML=FALSE, df )
+summary(mo4_p)
+```
+Similar results: pval<0.001 on both sectors 
+
+### Results
+  
+#### Correlation FI and Acceleration 
+
+#### All animals
+
+```{r}
+mo4<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+ sex+(1|ID), REML=FALSE, df )
+summary(mo4)
+```
+
+
+#### Stratification 
+
+##### Females
+
+```{r}
+#library(lmerTest)
+mo5<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+ (1|ID), REML=FALSE, df[df$sex=="M",] )
+summary(mo5)
+```
+```{r}
+mo5_M<-lmerTest::lmer(Acceleration~ns(FI_logit,knots = -2.313635)+ (1|ID), REML=FALSE, df[df$sex=="M",] )
+summary(mo5_M)
+```
+
+##### Males
+
+```{r}
+mo6<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+ (1|ID), REML=FALSE, df[df$sex=="F",] )
+summary(mo6)
+
+```
+
+
+### Body weight
+```{r}
+if(params$method=="residuals"){
+  model_loess <- loess(predicted_age~age_wk,Blood)
+  BL<-data_do%>% tidyr::drop_na() %>% mutate(Acceleration=round(model_loess$residuals,digits=1))
+}else{
+  BL<-data_do %>% tidyr::drop_na() %>% mutate(Acceleration=round(predicted_age-age_wk,digits=1))}
+```
+
+#### Plot
+
+```{r}
+FIplot3<-ggplot(data = BL, aes(y = scale(Acceleration), x =exp(bw)))+
+  geom_point( alpha = .2, size=1,col="brown")+
+  theme_minimal(
+  )+
+  geom_smooth(method = "lm", span=0.9999, col="darkblue")+
+  labs(title = "Relationship Body Weight - Acceleration",subtitle = "1995 mice (blood test and body weight)")+
+  xlab("\nBody weight (g)")+ 
+  ylab("Acceleration  (scaled)\n")
+FIplot3
+```
+```{r}
+F_BW_strain<-FIplot3+facet_wrap(~strain)
+```
+
+```{r}
+F_BW_sex<-FIplot3+facet_wrap(~sex)
+```
+
+```{r}
+ggsave(paste0(patho,"Plots/FI_plot_Acc_BW_strain_",params$dataset,".tiff",sep=""),
+F_BW_strain, device = "tiff",width = 12, height = 9,
+  units = c("cm"), dpi = 450)
+```
+
+```{r}
+ggsave(paste0(patho,"Plots/FI_plot_Acc_BW_sex_",params$dataset,".tiff",sep=""),
+F_BW_sex, device = "tiff",width = 12, height = 9,
+  units = c("cm"), dpi = 450)
+```
+
+
+```{r}
+ggsave(paste0(patho,"Plots/FI_plot_Acc_BW_",params$dataset,".tiff",sep=""),
+FIplot3, device = "tiff",width = 12, height = 9,
+  units = c("cm"), dpi = 400)
+```
+
+### LMM Models. Determine minimal adequate model
+Maximal model
+```{r}
+df<-BL
+
+mo7<-lmer(scale(bw)~scale(Acceleration) * sex * strain + scale(age_wk)+(1|ID), REML=FALSE, df)
+summary(mo7)
+```
+Model stratified by study
+Only SLAM
+```{r}
+mo7<-lmer(scale(bw)~scale(Acceleration) * sex + strain + scale(age_wk)+(1|ID), REML=FALSE, df[df$strain=="B6"|df$strain=="HET3",])
+summary(mo7)
+```
+
+Exclude highly correlated age (r = 0.511)
+Compare models with and without age as a predictor.
+
+```{r}
+mo8<-lmerTest::lmer(scale(bw)~scale(Acceleration)*sex+strain+(1|ID), REML = FALSE,df[df$strain=="B6"|df$strain=="HET3",])
+summary(mo8)
+```
+With and whithout age
+```{r}
+anova(mo7,mo8)
+```
+
+Simplification not justified. Keep age in the model
+
+Residualize acceleration
+```{r}
+df$Acceleration_rsz<-residuals(lm(Acceleration~age_wk,df))
+```
+
+
+```{r}
+mo9<-lmerTest::lmer(scale(bw)~scale(Acceleration_rsz)*sex+strain+(1|ID), REML = FALSE,df[df$strain=="B6"|df$strain=="HET3",])
+summary(mo9)
+```
+```{r}
+mo10<-lmerTest::lmer(scale(bw)~scale(Acceleration_rsz)+sex+strain+(1|ID), REML = FALSE,df[df$strain=="B6"|df$strain=="HET3",])
+summary(mo10)
+```
+```{r}
+anova(mo9,mo10)
+```
+Justified
+
+#### Results SLAM
+##### BW
+Minimal adequate model
+```{r}
+summary(mo10)
+```
+Model stratified by study
+Only JAX
+```{r}
+mo11<-lmer(scale(bw)~scale(Acceleration) * sex + scale(age_wk)+(1|ID), REML=FALSE, df[df$strain=="DO",])
+summary(mo11)
+```
+
+Residualize acceleration on highly correlated age (r = 0.665)
+
+```{r}
+df$Acceleration_rsz<-residuals(lm(Acceleration~age_wk,df))
+```
+
+```{r}
+mo12<-lmer(scale(bw)~scale(Acceleration_rsz) * sex +(1|ID), REML=FALSE, df[df$strain=="DO",])
+summary(mo12)
+```
+BW late life
+```{r}
+BL2<-BL %>% mutate(YAO = ntile(bw,3))
+df<-BL2 %>% filter(YAO==2|YAO==3)
+mo7<-lmer(scale(bw)~scale(Acceleration) + sex + strain + scale(age_wk)+(1|ID), REML=FALSE, df)
+summary(mo7)
+```
+
+```{r}
+sessionInfo()
+```

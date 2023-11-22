@@ -1,0 +1,653 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "(Method to imput missingness:`r params$imput_missingness`) "
+author: "Jorge Martinez-Romero"
+date: "2023-07-28"
+format: html 
+params:
+  impute_missingness: "Mean" # "Mean","Spline","MissForest" 
+toc: true   
+self-contained: true  
+---
+
+
+### ----------------------------------------------------------------------------
+### PREPROCESSING JACKSON-LAB DATASET    
+### ----------------------------------------------------------------------------
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+```{r libraries, echo=FALSE, include=FALSE}
+library("tidyverse")
+library("rio") 
+library("readxl")
+library("magrittr")
+library("groupdata2")
+library("data.table")
+library("zoo")
+```
+
+
+#### Determine natural death and censor
+This dataset delivered by JAX Labs shows timepoints column wise instead of row wise with age as a part of the column label (e.g. "rbc.6", rbc.12). 
+Natural and non-natural causes of death are included in the variable "Death.type". 
+
+Strategy:
+1)  Censor (=0) all non-natural causes of death according to Gary Churchill 
+    Andrew Deighan email to distinguish from natural causes(=1)
+2)  Select overlapped variables between SLAM and Jackson studies.
+3)  Extract and transform timepoints from months to weeks and from column wise 
+    to row wise.
+4)  Build wave variable and change JAX names to make them coincide with SLAM's
+***
+
+#####  Death.type levels
+```{r}
+# Import Jackson file----------------------------------------------
+JAX<-read.csv(paste0(patho,"Tables/Source/jax_clock.csv",sep=""))
+#Type of death (1=natural, 0=censored) As per email Andrew Deighan
+  JAX$Death.type<-as.factor(JAX$Death.type)
+  natural_death<-JAX$Death.type
+  levels(JAX$Death.type)
+```
+#### Select overlapped variables SLAM-Jackson_Lab 
+
+```{r, warning=FALSE, echo=FALSE}
+#censored
+  levels(natural_death)[c(1:5,16,18:22)]<-0
+  #natural death
+  levels(natural_death)[c(2:14)]<-1
+  JAX$natural_death<-natural_death
+
+  #Variables matching the ones in SLAM 
+  JAX2<-JAX[,c(1:4,23:26,60:62,150:152,63:140,144:146,308:310,314)]
+```
+
+#### Data wrangling and dataset formating to match SLAM
+Mice Age at assy determination in Jackson Lab dataset.
+The dataset includes Hematology and glucose date of assy. Variables "hema.date_6", "hema.date_12" and "hema.date_18" represent date of blood draw when animal is 6,12,18 months of age. Idem fro glucose. Age determined by just subtracting date of birth from date of assy in weeks. BW has no date of assy in the dataset. Age in weeks is for the assy is determined from column name, e.g. bw.29 represent the bw when the mice are 29 weeks of age (approx 6 months). The age mean value between bw, hematology and glucose test is assigned to the "age in weeks" variable (Age_wk) for each specific wave.  
+
+```{r, warning=FALSE, echo=FALSE}
+colnames(JAX2)<-gsub(pattern = "\\.([0-9]+)$",replacement = "\\_\\1",x = colnames(JAX2))
+ 
+   JAX2<-JAX2 %>% 
+    pivot_longer(
+    cols = !c("Mouse.ID","Sex","Generation","natural_death",
+              "hema.date_6","hema.date_12","hema.date_18",
+              "gluc.date_6","gluc.date_12","gluc.date_18","DOB","lifespan"),
+    names_to = c("Var","Age"),
+    names_pattern = "(.*)_(.*)",
+    values_to = "Val",
+    names_transform = list(Age = as.integer)
+  ) %>% as.data.frame()
+```
+
+
+```{r, warning=FALSE, echo=FALSE}
+JAX2<-JAX2 
+   JAX2$hema.date_6<-as.Date(JAX2$hema.date_6,format ="%m/%d/%Y")
+   JAX2$hema.date_12<-as.Date(JAX2$hema.date_12,format ="%m/%d/%Y")
+   JAX2$hema.date_18<-as.Date(JAX2$hema.date_18,format ="%m/%d/%Y")
+   JAX2$gluc.date_6<-as.Date(JAX2$gluc.date_6,format ="%m/%d/%Y")
+   JAX2$gluc.date_12<-as.Date(JAX2$gluc.date_12,format ="%m/%d/%Y")
+   JAX2$gluc.date_18<-as.Date(JAX2$gluc.date_18,format ="%m/%d/%Y")
+   JAX2$DOB<-as.Date(JAX2$DOB,format ="%m/%d/%Y")
+   
+   
+   JAX2<-JAX2 %>% mutate(AgeBlood6=as.integer(difftime(hema.date_6,DOB, units = "weeks")),
+                         AgeBlood12=as.integer(difftime(hema.date_12,DOB, units = "weeks")),
+                         AgeBlood18=as.integer(difftime(hema.date_18,DOB, units = "weeks")),
+                         AgeGlu6=as.integer(difftime(gluc.date_6,DOB, units = "weeks")),
+                         AgeGlu12=as.integer(difftime(gluc.date_12,DOB, units ="weeks")),
+                         AgeGlu18=as.integer(difftime(gluc.date_18,DOB, units = "weeks")))
+  
+   JAX2<-JAX2 %>% 
+   mutate(Age_wk = case_when( 
+    Age == 6 ~ round((29+AgeBlood6+AgeGlu6)/3,digit=0),# 
+    Age == 12 ~ round((55+AgeBlood12+AgeGlu12)/3,digit=0),
+    Age == 18 ~ round((81+AgeBlood18+AgeGlu18)/3,digit=0),
+    Age == 29 ~ round((29+AgeBlood6+AgeGlu6)/3,digit=0),
+    Age == 55 ~ round((55+AgeBlood12+AgeGlu12)/3,digit=0),
+    Age == 81 ~ round((81+AgeBlood18+AgeGlu18)/3,digit=0)))
+```
+
+
+```{r, warning=FALSE, echo=FALSE}
+#From long to wide dataframe
+  
+# reshape2::dcast(JAX2,formula=Mouse.ID+Age_wk+Var~Val)#Mouse.ID+Age_wk+Sex+Generation+natural_d
+# JAX4<-reshape2::dcast(JAX2,Mouse.ID+Var+Age_wk~Val)
+# eath+lifespan+
+
+JAX3<-JAX2 %>% 
+    pivot_wider(
+    id_cols = c(Mouse.ID,Age_wk,Sex,Generation,natural_death,lifespan),
+    names_from = Var,
+    values_from = "Val") %>% filter(!is.na(Age_wk)) %>% unnest() %>% as.data.frame()
+    JAX3$strain<-"DO"
+
+str(JAX3)
+```
+
+
+```{r, warning=FALSE, echo=FALSE}
+#Add WAVE variable JAX
+  #library(tibble)
+JAX3<-JAX3 %>% group_by(Mouse.ID) %>% mutate(wave=rank(Age_wk))%>% 
+    relocate(wave,.after = Mouse.ID) %>% 
+    rename("idno"="Mouse.ID","cohort"="Generation") %>% 
+    mutate(lifespan=round(lifespan/7,digits = 0))
+```
+
+
+```{r, warning=FALSE, echo=FALSE}
+#DRop NA in all blood parameters
+  JAX3$nas<-rowSums(is.na(JAX3))
+  #Identify rows with NAs in one third of all features (9)
+  nass<-which(JAX3$nas>=9)# no one
+  nass
+```
+
+
+```{r, warning=FALSE, echo=FALSE}
+
+table(is.na(JAX3$natural_death))
+```
+
+
+```{r}
+JAX3$natural_death[is.na(JAX$natural_death)]<-0
+JAX3<-as.data.frame(JAX3)
+str(JAX3)
+```
+
+NAs in JAX3 dataset
+```{r}
+
+apply(apply(JAX3,2,is.na),2,sum)
+```
+Remove variables with too many NAs
+```{r}
+JAX_RAW<-JAX3<-JAX3 %>% dplyr::select(-c(chr,n.retic,p.retic))
+apply(apply(JAX3,2,is.na),2,sum)
+```
+Set 0 to 1/2 min value detected
+```{r}
+Features<-colnames(JAX3)[8:32]
+Clumps<-colnames(JAX3)[33]
+All_vb<-c(Features,Clumps)
+
+JAX3[All_vb] <- 
+lapply(JAX3[All_vb] , function(x) replace(x, x == 0, min(x[x>0], na.rm = TRUE)/2))
+```
+
+#### Transformation
+Transform percentages to logit 
+```{r}
+library(LaplacesDemon)
+
+pctes<-c('p.neut','p.lymph','p.mono','p.eos')
+resto<-setdiff(All_vb,pctes)
+logitt <- function (vector) {
+  vector_trf<-rep(0,length(vector) )
+        i<-1
+        for(i in 1:length(vector)){
+         # browser()
+        if (!is.na(vector[i])){vector_trf[i]<-logit(vector[i]/100) 
+        } else if (is.na(vector[i])) {vector_trf[i]<-NA}
+        i<-1+i
+        }
+        return(vector_trf)
+  }
+JAX3$p.neut<-logitt(JAX3$p.neut)
+JAX3$p.lymph<-logitt(JAX3$p.lymph)
+JAX3$p.mono<-logitt(JAX3$p.mono)
+JAX3$p.eos<-logitt(JAX3$p.eos)
+
+
+```
+
+
+Transform remaining numeric to log 
+```{r}
+JAX3[resto]<-sapply(JAX3[resto] , function(x) ifelse(is.na(x),NA,log(x)))
+```
+
+
+#### Plot densities with outliers
+```{r}
+
+ggplot(reshape2::melt(JAX3[,All_vb], key = "variable", value = "value"), aes(value)) +
+  geom_density() +
+  theme(panel.background = element_rect(fill = "wheat"))+
+  facet_wrap(~variable, scales = "free")
+```
+
+
+
+
+```{r Remove outliers,echo=FALSE }
+check_outlier <- function(v, coef=1.5){
+  quantiles <- quantile(v,probs=c(0.25,0.75),na.rm=T)
+  IQR <- quantiles[2]-quantiles[1]
+  res <- v < (quantiles[1]-coef*IQR)|v > (quantiles[2]+coef*IQR)
+  return(res)
+}
+```
+
+#### Outliers (Remove by sex)
+```{r ,echo=FALSE }
+datax<-data.table(JAX3)
+all<-All_vb
+for (i in 1:length(all)){
+    x<-all[i]
+    variable <-paste0("out_",x)
+    datax[,outlier:= check_outlier (get(x)),by = c("Sex")]
+    datax[,label:=ifelse(outlier,datax[,get(x)],"")]
+    datax[datax$outlier==TRUE,x]<-NA
+    datax<-datax %>% rename(!!variable :=  "label") %>% select(-outlier) 
+    }
+dataxJ<-as.data.frame(datax)# Save outliers removed
+JAX3<-dataxJ[,1:35]
+```
+
+
+
+Plot densities (JAX)
+```{r}
+ggplot(reshape2::melt(JAX3[,All_vb], key = "variable", value = "value"), aes(value)) +
+  geom_density() +
+  theme(panel.background = element_rect(fill = "wheat"))+
+  facet_wrap(~variable, scales = "free")
+
+```
+
+
+
+NAs to impute after remove outliers
+```{r}
+apply(apply(JAX3,2,is.na),2,sum)
+```
+
+
+
+
+
+
+### SPLIT JAX (TRAIN - validateJ - VALIDATEJ2)   
+
+
+#### Split. 
+Strategy: Keep one randomly selected cohort out for final validation
+in a small group. Use same set seed.
+Then split the remaining data 4:1 to validate the model in a larger group.   
+
+Store data in 3 Dataframes.
+-train: Dataset corresponding to 3/4 after selection a random cohort.
+-vald: Dataset corresponding to 1 cohort from each study. 
+-validate2: Dataset corresponding to pool of cohorts 1/4 after selection a random cohort.
+
+Keep all samples from the same mouse clustered together in the same dataset, to avoid information leakage.
+Stratify the splitting (by cohort, strain and sex) to have balanced representation between the training and validating dataset
+```{r}
+JAX3[,"idno"]<-as.factor(JAX3[,"idno"])
+JAX<-JAX3
+set.seed(365)
+sample(1:5,1) # cohort 2
+validateJ<-JAX %>% filter(cohort=="G8")
+JAX70<-JAX %>% filter(cohort!="G8")
+
+#Keep same idno in one dataset. Balance in Sex cohort 
+parts <- partition(JAX70, p = 0.2, id_col ="idno", cat_col = c("Sex","cohort"))
+trainJ<-as.data.frame(parts[[2]])
+validateJ2<-as.data.frame(parts[[1]])
+rm(parts,nass)
+```
+
+Check that no same Ids are in train and validate
+```{r}
+intersect(trainJ$idno,validateJ2$idno)
+```
+
+NAs in Training dataset
+```{r}
+apply(apply(trainJ,2,is.na),2,sum)
+```
+
+NAs in validateJ2 dataset
+```{r}
+apply(apply(validateJ2,2,is.na),2,sum)
+```
+NAs in validateJ dataset
+```{r}
+apply(apply(validateJ,2,is.na),2,sum)
+```
+
+
+Transform ID to numeric and add a "S" letter (to old ID) to distinguish from IDS in SLAM study after merging both datasets
+```{r}
+
+trainJ_NA <-trainJ %>% 
+  mutate(olID = paste0("J",as.character(idno))) 
+                           
+validateJ2_NA <-validateJ2 %>% 
+  mutate(olID = paste0("J",as.character(idno))) 
+
+validateJ_NA <-validateJ %>% 
+  mutate(olID = paste0("J",as.character(idno))) 
+
+```
+
+
+### IMPUTE MISSINGNESS (SEPARATED) 
+#### Three methods:
+Mean value by time point, sex. 
+Spline by individual
+Using Random Forest
+
+```{r}
+#Function to check NAs
+nas<-function(df){apply(apply(df,2,is.na),2,sum)}
+```
+
+
+```{r Remove NAs,echo=FALSE }
+#| echo: false
+#| warning: false
+
+#Method impute mean by sex strain and timepoint.
+if(params$impute_missingness=="Mean"){
+fillna <- function(x) {ifelse(is.na(x), mean(x,na.rm=TRUE),x)}
+
+trainJ<-trainJ_NA %>% 
+    group_by(Sex,Age_wk) %>%
+          mutate_each(funs(fillna), all_of(c(All_vb)))
+validateJ<-validateJ_NA %>% 
+    group_by(Sex,Age_wk) %>%
+          mutate_each(funs(fillna), all_of(c(All_vb)))
+validateJ2<-validateJ2_NA %>% 
+    group_by(Sex,Age_wk) %>%
+          mutate_each(funs(fillna), all_of(c(All_vb)))
+
+
+
+}
+
+#method to impute using the spline by ID
+if(params$impute_missingness=="Spline"){
+fillna <- function(x) {ifelse(is.na(x),  na.spline(x,maxgap=3, na.rm = FALSE),x)}
+
+trainJ<-trainJ_NA %>% 
+    group_by(idno) %>%
+          mutate_each(funs(fillna), all_of(c(All_vb)))
+
+validateJ<-validateJ_NA %>% 
+    group_by(idno) %>%
+          mutate_each(funs(fillna), all_of(c(All_vb)))
+
+validateJ2<-validateJ2_NA %>% 
+    group_by(idno) %>%
+          mutate_each(funs(fillna), all_of(c(All_vb)))
+}
+
+#Method to imput ussing Random Forest
+if(params$impute_missingness=="MissForest"){
+fillna <- function(df, ...){
+
+  dm_prep <- df %>%
+    select(-c(...)) %>%
+    data.matrix()
+  
+  set.seed(365)
+  
+  imp <- missForest(dm_prep, ntree = 500)
+  
+  df_imp <- imp$ximp %>%
+    as.data.frame() 
+  
+  df_final <- df_imp 
+  
+  return(df_final)
+  }
+
+trainJ <- fillna(trainJ_NA, ... = idno,wave,nas,oldID) 
+validateJ<-cbind(validateJ,validateJ_NA[,c("idno","wave","nas","oldID")])
+
+validateJ <- fillna(validateJ_NA, ... = idno,wave,nas,oldID)  
+validateJ<-cbind(validateJ,validateJ_NA[,c("idno","wave","nas","oldID")])
+
+validateJ2 <- fillna(validateJ2_NA, ... = idno,wave,nas,oldID)  
+validateJ2<-cbind(validateJ2,validateJ2_NA[,c("idno","wave","nas","oldID")])
+}
+```
+
+
+NAs after impute Train
+```{r}
+apply(apply(trainJ,2,is.na),2,sum)
+```
+
+
+
+NAs after impute validateJ
+```{r}
+apply(apply(validateJ2,2,is.na),2,sum)
+```
+
+
+NAs after impute validateJ2
+```{r}
+apply(apply(validateJ2,2,is.na),2,sum)
+```
+
+
+
+
+### HARMONIZATION: Batch effect correction: 
+
+
+Fit a mixed effect model once the Features has been transformed to determine the random effect coefficient corresponding to each cohort 1 to 10. NAs not avoided. ID, strain and cohort are considered random effects. One model per feature as outcome,e.g.:
+RBC ~ sex + (1|cohort)+(1|olID). Use old ID as a factor. No strain variable (only DO)
+Then subtract that random coefficient (per cohort) from values under each variable. Since Age is the outcome to be predicted by the clock, Age is not included in this model (to avoid information leakage).
+```{r}
+library(lme4)
+Harmonize<-function (dataframe,Variables){
+      i<-1; df<-as.data.frame(get(dataframe))
+      Harmo_list<-list()
+      for (i in 1:length(Variables)) {
+          name_pre<-Variables[i]#name of predictor e.g. rbc
+          predictor<-with(df,get(name_pre))# extract the values of that column e.g., rbc
+          mod_no_Age<-lmer(predictor ~ Sex +(1|cohort)+(1|olID),df)#model
+          randon_intercept<-ranef(mod_no_Age)#extract All random intercept differences.
+          randon_intercept_per_cohort<-randon_intercept$cohort #filter cohort only 
+          randon_intercept_per_cohort <- 
+          rownames_to_column(randon_intercept_per_cohort, "Cohort") 
+          #Subtract that coefficient per cohort and variable from original values.
+          df<-df %>% 
+            mutate(ajust=randon_intercept_per_cohort[match(df$cohort,
+            randon_intercept_per_cohort$Cohort),"(Intercept)"]) %>%  
+                             mutate(xx=round((predictor-ajust),digit=2)) %>% 
+                                 rename(!!paste(name_pre, "Harmonized", sep = ".") := xx)
+          Harmo_list[[i]]<-mod_no_Age
+          i<-1+i
+      }
+     names(Harmo_list)<-Variables
+  data_hr<-paste0(dataframe,"_harmonized",sep="")
+  list_hr<-paste0("list_models_",dataframe,"_harmonized",sep="")
+  df<-df %>% dplyr::select(-ajust)
+  assign(data_hr,df, envir=globalenv())
+  assign(list_hr,Harmo_list, envir=globalenv())
+  return(df)
+}
+```
+
+#### Train
+Harmonize train (separated from validateJ to avoid information leakage)
+Save percentage of cohort variance from total variance (Summary:Random)
+as per Feature in a vector "Variance_cohort_pct"
+```{r}
+trainJ<-trainJ %>% mutate(olID=as.factor(olID))
+Harmonize(dataframe="trainJ",Variables = c(Features,Clumps))
+
+BB<-lapply(list_models_trainJ_harmonized,summary)
+CC<-lapply(BB,function(x) as.data.frame(x$varcor)[,c(1,5)])
+Pct_variance_cohort<-t(as.data.frame(lapply(CC,function(x) 100*(x[2,2]/sum(x[,2])))))
+colnames(Pct_variance_cohort)<-"Variance_cohort_pct"
+rm(BB,CC,AA)
+
+as.data.frame(Pct_variance_cohort) %>% arrange(desc(Variance_cohort_pct))%>% round(digit=4)
+
+```
+
+#####Check Batch effect removal
+```{r}
+Featur_ht<-paste0(c(Features,Clumps),".Harmonized",sep="")
+Harmonize(dataframe="trainJ_harmonized",Variables = Featur_ht)
+
+BB<-lapply(list_models_trainJ_harmonized_harmonized,summary)
+CC<-lapply(BB,function(x) as.data.frame(x$varcor)[,c(1,5)])
+Pct_variance_cohort_harmonized<-t(as.data.frame(lapply(CC,function(x) 100*(x[2,2]/sum(x[,2])))))
+colnames(Pct_variance_cohort_harmonized)<-"Variance_cohort_pct"
+rm(BB,CC,AA)
+
+as.data.frame(Pct_variance_cohort_harmonized) %>% arrange(desc(Variance_cohort_pct)) %>% round(digit=4)
+
+```
+
+
+#### ValidateJ2
+Harmonize
+```{r}
+validateJ2<-validateJ2 %>% mutate(olID=as.factor(olID))
+Harmonize("validateJ2", c(Features,Clumps))
+BB<-lapply(list_models_validateJ2_harmonized,summary)
+CC<-lapply(BB,function(x) as.data.frame(x$varcor)[,c(1,4)])
+Pct_variance_cohort<-t(as.data.frame(lapply(CC,function(x) 100*(x[2,2]/sum(x[,2])))))
+colnames(Pct_variance_cohort)<-"Variance_cohort_pct"
+rm(BB,CC,AA)
+
+as.data.frame(Pct_variance_cohort) %>% arrange(desc(Variance_cohort_pct))%>% round(digit=4)
+
+```
+
+
+##### Check Batch effect removal
+```{r}
+Featur_ht<-paste0(c(Features,Clumps),".Harmonized",sep="")
+Harmonize(dataframe="validateJ2_harmonized",Variables = Featur_ht)
+
+BB<-lapply(list_models_validateJ2_harmonized_harmonized,summary)
+CC<-lapply(BB,function(x) as.data.frame(x$varcor)[,c(1,4)])
+Pct_variance_cohort_harmonized<-t(as.data.frame(lapply(CC,function(x) 100*(x[2,2]/sum(x[,2])))))
+colnames(Pct_variance_cohort_harmonized)<-"Variance_cohort_pct"
+rm(BB,CC,AA)
+
+as.data.frame(Pct_variance_cohort_harmonized) %>% arrange(desc(Variance_cohort_pct)) %>% round(digit=4)
+
+```
+
+
+
+### CLUMPS
+Adjust eosinophils and platelets by clumps:
+Similar strategy applied to cohort-effect harmonization. Clump-formation is considered as a random-effect. A linear mixed effect model is fitted and the random coefficients determined by the model are subtracted from platelets and eosinophils values. Age is kept out of the model to avoid information leakage.
+```{r}
+Adjust_clumps<-function (dataframe,Variables,adjustVble){
+      i<-1; df<-get(dataframe)
+      for (i in 1:length(Variables)) {
+          name_pre<-Variables[i]
+          predictor<-with(df,get(name_pre))
+          formu<-as.formula(paste0("predictor ~ Sex + (1|",adjustVble,")  + (1|olID)"))
+          mod_no_Age<- lmer(formu,df)
+          ran_coef<-ranef(mod_no_Age)#extract random coefficient per level of clumps.
+          coef_clumps<-ran_coef[[adjustVble]] 
+          coef_clumps<-rownames_to_column(coef_clumps, adjustVble) 
+          in_data_frame<-as.vector(round(df[,adjustVble],6))
+          in_model<-round(as.numeric(coef_clumps[,adjustVble]),6)
+          #Subtract coefficient from variable matching level of clumps
+          df$adjust<-coef_clumps[match(in_data_frame, in_model),"(Intercept)"] 
+          df$xx<-round((df[,name_pre]-df[,"adjust"]),digit=2)
+          #rename variable
+          df<-df %>% rename(!!paste(name_pre, "adj_clumps", sep = ".") := xx)
+          }
+  data_hr<-paste0(dataframe,"_adj_clumps",sep="")
+  df<-df %>% dplyr::select(-adjust)
+  assign(data_hr,df, envir=globalenv())
+}
+```
+##### Adjust  Eosin and Plt (trainJ)
+
+```{r}
+eos_plat<-c("n.eos.Harmonized","p.eos.Harmonized","plt.Harmonized")
+Adjust_clumps(dataframe = "trainJ_harmonized",Variables =eos_plat,"clumps.Harmonized")
+```
+
+
+##### Adjust  Eosin and Plt (validate2)
+```{r}
+Adjust_clumps(dataframe = "validateJ2_harmonized",Variables =eos_plat,"clumps.Harmonized")
+```
+
+
+##### Adjust  Eosin and Plt (validateJ)
+
+```{r}
+#Version for this dataset including one unique cohort not harmonized. The output of in_data_frame is a list
+Adjust_clumps2<-function (dataframe,Variables,adjustVble){
+      i<-1; df<-get(dataframe)
+      for (i in 1:length(Variables)) {
+          name_pre<-Variables[i]
+          predictor<-with(df,get(name_pre))
+          formu<-as.formula(paste0("predictor ~ Sex + (1|",adjustVble,") + (1|olID)"))
+          mod_no_Age<- lmer(formu,df)
+          ran_coef<-ranef(mod_no_Age)#extract random coefficient per level of clumps.
+          coef_clumps<-ran_coef[[adjustVble]] 
+          coef_clumps<-rownames_to_column(coef_clumps, adjustVble) 
+          in_data_frame<-as.vector(round(df[,adjustVble],6))[[1]] #Pull first element from the list (bug)
+          in_model<-round(as.numeric(coef_clumps[,adjustVble]),6)
+          #Subtract coefficient from variable matching level of clumps
+          df$adjust<-coef_clumps[match(in_data_frame, in_model),"(Intercept)"] 
+          df$xx<-round((df[,name_pre]-df[,"adjust"]),digit=2)
+          #rename variable
+          df<-df %>% rename(!!paste(name_pre, "adj_clumps", sep = ".") := xx)
+          }
+  data_hr<-paste0(dataframe,"_adj_clumps",sep="")
+  df<-df %>% dplyr::select(-adjust)
+  assign(data_hr,df, envir=globalenv())
+}
+```
+
+
+```{r}
+eos_plat<-c("n.eos","p.eos","plt")
+Adjust_clumps2(dataframe = "validateJ",Variables =eos_plat ,"clumps")
+validateJ_adj_clumps<-data.table(validateJ_adj_clumps)
+validateJ_adj_clumps<-as.data.frame(validateJ_adj_clumps)
+```
+
+
+```{r}
+trainJ_harmonized_adj_clumps$natural_death<-as.numeric(as.character(trainJ_harmonized_adj_clumps$natural_death))
+validateJ2_harmonized_adj_clumps$natural_death<-as.numeric(as.character( validateJ2_harmonized_adj_clumps$natural_death))
+
+
+validateJ_adj_clumps$natural_death<-as.numeric(as.character(validateJ_adj_clumps$natural_death))
+```
+
+
+
+```{r, eval=FALSE}
+save(trainJ_harmonized_adj_clumps, 
+    validateJ_adj_clumps,
+    validateJ2_harmonized_adj_clumps,
+    JAX_RAW, 
+    patho,
+    file=paste0(patho,"Tables/Transitions/JAX_for_modeling_72_10_18.Rdata",sep=""))
+
+```
+

@@ -1,0 +1,172 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
+
+author: "Jorge Martinez-Romero"
+date: "2023-09-28"
+format: html 
+params:
+  sex: "All" # "F", "M", "All". 
+  strain: "All" # "B6", "HET3", "DO", "All"
+  method: "differences" # Calculate age acceleration as the "differences" between predicted age and chronological age or as "residuals" after regresing predicted age on chronological age using a non linear regresssion
+  dataset: "All" #Select the dataset in where to perform analyses: "All","vald","validate2", "All_held_out","train"
+toc: true   
+self-contained: true  
+---
+
+
+## CLOCKS PERFORMANCE BY AGE RANGE: 
+Stratify clock predictions by Young, adult and old mice
+
+***
+```{r setup, include=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+## Parameters
+### Parameter explanation.
+- sex: "F".  Select sex: "F", "M", "All".
+- strain: "All".  Select strain: "B6", "HET3", "DO", "All".
+- method: "differences".  Calculate age acceleration as:.
+  - "differences" between predicted age and chronological age or as
+  - "residuals" after regressing predicted age on chronological age
+    using a non linear loess.
+- dataset: "All". Select the dataset in where to perform analyses:
+    "All", "Vald" (Cohort C07 G08) "Validate2" (Pool of cohorts), "All_held_out" (Includes all samples held out during the training process [Vald + Validate2]), "train" (Training set only).
+    
+```{r libraries, echo=TRUE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("ggplot2")
+library("tidyverse")
+library("dplyr")
+library("survival") 
+library("Metrics")
+library("h2o")
+library("data.table")
+library("Metrics")
+library("eha")
+library("kableExtra")
+library("quantreg")
+library("exact2x2")
+library("utils")
+library("LaplacesDemon")
+library("lme4")
+library("DT")
+library("splines")
+
+```
+
+###  Retrieve data and predict
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+```
+1)  Function add deltas
+
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+### Select features to add delta (No categoricals)
+
+```{r}
+Features<-c("rbc","mcv","mchc","mch","chcm","hdw"  
+,"wbc","plt","glucose","bw")
+```
+
+------------------------------------------------------------------------
+
+```{r}
+Features
+```
+
+------------------------------------------------------------------------
+
+### Load best DNN after tuning
+
+```{r, echo=TRUE}
+library(h2o)
+h2o.init()
+pat<-paste0(patho,"Models/Models_tunning/DNN_blood_62_N1691016783.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+
+```
+
+### Predict using the best DNN tuned
+
+```{r}
+train$dataset<-"train"
+validate2$dataset<-"validate2"
+vald$dataset<-"vald"
+data_all<-rbind(train,validate2,vald)
+data_all<-Add_delta_variable(data_all,Features)
+```
+
+Select Dataset to run the analysis according to parameter params$dataset
+
+```{r,warning=FALSE}
+  if(params$dataset == "All_held_out"){
+    data_all<-data_all[data_all$dataset!="train",]}
+  if(params$dataset == "train"){
+    data_all<-data_all[data_all$dataset=="train",]}
+  if(params$dataset == "vald"){
+    data_all<-data_all[data_all$dataset=="vald",]}
+  if(params$dataset == "validate2"){
+    data_all<-data_all[data_all$dataset=="validate2",]}
+```
+
+Select the sex and the strain according to the parameters sex and strain
+
+### Calculate acceleration depending on the method selected
+
+```{r, eval=FALSE}
+if(params$method=="residuals"){
+  model_loess <- loess(predicted_age~age_wk,data_all)
+  AA<-data_all%>% tidyr::drop_na() %>% mutate(Acceleration=model_loess$residuals)
+}else{
+  AA<-AA%>% tidyr::drop_na() %>% mutate(Acceleration=predicted_age-age_wk)}
+```
+
+## Results
+### RMSE per Y,A,O
+Calculate RMSE by young, adult, old
+```{r}
+temple<-data_all %>% select(ID,age_wk) %>%  mutate(Q=ntile(age_wk,3))
+Validate <- as.h2o(data_all)
+    Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+    temple$Pre_age<-as.vector(Hematology_Based_Age)
+    
+temple  %>% 
+  split(temple$Q)  %>% 
+  map(\(df) rmse(df$age_wk,df$Pre_age))
+```
+
+### MAE per Y,A,O
+```{r}
+temple  %>% 
+  split(temple$Q)  %>% 
+  map(\(df) mae(df$age_wk,df$Pre_age))
+```
+
+### R by Y,A,O
+```{r}
+temple  %>% 
+  split(temple$Q)  %>% 
+  map(\(df) lm(age_wk ~ Pre_age, data = df)) %>% 
+  map(summary)  %>% 
+  map_dbl("r.squared") %>% sqrt()
+
+```
+

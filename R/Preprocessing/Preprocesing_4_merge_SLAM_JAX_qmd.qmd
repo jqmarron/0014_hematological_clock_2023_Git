@@ -1,0 +1,244 @@
+---
+title: "Hematological Clock 016"
+author: "Jorge Martinez-Romero"
+date: "2023-07-24"
+output: html_document
+---
+
+### ----------------------------------------------------------------------------
+### PREPROCESSING MERGING SLAM AND JAX
+### ----------------------------------------------------------------------------
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+
+```
+
+```{r libraries, echo=FALSE, include=FALSE}
+library("tidyverse")
+library("rio") 
+library("readODS")
+library("data.table")
+library("readxl")
+library("magrittr")
+library("groupdata2")
+```
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/SLAM_for_modeling_72_10_18_.Rdata", sep=""))
+load(paste0(patho,"Tables/Transitions/JAX_for_modeling_72_10_18.Rdata", sep=""))
+```
+
+Train and test (% to logit, remaining features to log, no outliers, missingness 
+imputation, no cohort effect, platelets and eosinophils adjusted to clumps,
+highly correlated variables [r > 0.80] removed)
+
+SLAM
+[1] "RBC.Harmonized"               "pct_LUC.Harmonized"            "MCV.Harmonized"    [4] "MCH.Harmonized"               "MCHC.Harmonized"               "PDW.Harmonized"   [7] "CHCM.Harmonized"              "RDW.Harmonized"                "HDW.Harmonized"   [10] "MPV.Harmonized"              "pct_LYM.Harmonized"            "pct_EOS.Harmonized.adj_clumps"
+[13] "mature_CHDW.Harmonized"      "pct_MONO.Harmonized"           "PLT.Harmonized.adj_clumps"    
+[16] "abs_neuts.Harmonized"        "abs_lucs.Harmonized"           "abs_eos.Harmonized.adj_clumps"
+[19] "abs_Retic.Harmonized"        "CHg.Harmonized"                "WBC.Harmonized"  [22] "retic_MCV.Harmonized"        "Glucose.Harmonized"            "bw.Harmonized"   [25] "abs_clumps.Harmonized"      
+
+JAX (% to logit, remaining features to log, no outliers, no NA,
+no cohort effect, platelets and eosinophils adjusted to clumps)
+
+[35] "olID"                        "bw.Harmonized"              
+[37] "gluc.Harmonized"             "wbc.Harmonized"             
+[39] "rbc.Harmonized"              "hgb.Harmonized"             
+[41] "chgb.Harmonized"             "hct.Harmonized"             
+[43] "mcv.Harmonized"              "mch.Harmonized"             
+[45] "mchc.Harmonized"             "ch.Harmonized"              
+[47] "chcm.Harmonized"             "rdw.Harmonized"             
+[49] "hdw.Harmonized"              "plt.Harmonized"             
+[51] "mpv.Harmonized"              "mpm.Harmonized"             
+[53] "p.neut.Harmonized"           "p.lymph.Harmonized"         
+[55] "p.mono.Harmonized"           "p.eos.Harmonized"           
+[57] "n.neut.Harmonized"           "n.lymph.Harmonized"         
+[59] "n.mono.Harmonized"           "n.eos.Harmonized"           
+[61] "clumps.Harmonized"           "n.eos.Harmonized.adj_clumps"
+[63] "p.eos.Harmonized.adj_clumps" "plt.Harmonized.adj_clumps"" 
+
+```{r}
+#Overlapping
+All<-c(
+"olID","wave", "Age_wk","sex",  "cohort","lifespan_2022",        "natural_death_2022",              
+"strain","RBC.Harmonized" ,      "MCV.Harmonized",               "MCH.Harmonized",
+"MCHC.Harmonized" ,              "CHCM.Harmonized" ,             "RDW.Harmonized" ,          
+"HDW.Harmonized",                "MPV.Harmonized"  ,             "pct_MONO.Harmonized",
+"pct_LYM.Harmonized" ,           "abs_eos.Harmonized.adj_clumps",       
+"WBC.Harmonized",                "abs_neuts.Harmonized" ,
+"Glucose.Harmonized",            "bw.Harmonized"  ,              
+"abs_clumps.Harmonized" ,        
+"pct_EOS.Harmonized.adj_clumps", "PLT.Harmonized.adj_clumps")
+
+#Names in validate different because were not harmonize (1 cohort)
+All_v<-c(
+    "olID","wave", "Age_wk","sex",  
+    "cohort","lifespan_2022", "natural_death_2022", "strain",
+    "RBC_log" ,          "MCV_log" ,        "MCH_log" ,
+    "MCHC_log"   ,       "CHCM_log"  ,      "RDW_log" ,       
+    "HDW_log" ,          "MPV_log"  ,       "pct_MONO_logit",
+    "pct_LYM_logit" ,    "abs_eos.adj_clumps",
+    "WBC_log",           "abs_neuts_log" ,
+    "Glucose_log" ,      "bw_log"   ,  
+    "abs_clumps_log",
+    "pct_EOS.adj_clumps",  "PLT.adj_clumps")
+
+
+All_jax<-c("olID","wave", "Age_wk","Sex","cohort","lifespan","natural_death",              
+"strain", 
+"rbc.Harmonized",              "mcv.Harmonized",              "mch.Harmonized",
+"mchc.Harmonized",             "chcm.Harmonized",             "rdw.Harmonized",
+"hdw.Harmonized",              "mpv.Harmonized",              
+"p.lymph.Harmonized",          "n.eos.Harmonized.adj_clumps", "p.mono.Harmonized",
+"wbc.Harmonized",              "n.neut.Harmonized",               
+"gluc.Harmonized",             "bw.Harmonized", 
+"clumps.Harmonized",           
+"p.eos.Harmonized.adj_clumps", "plt.Harmonized.adj_clumps")
+
+```
+
+
+```{r}
+trainS<-train_harmonized_adj_clumps[All] %>% rename(Sex=sex) %>%
+              mutate(Project="SLAM")  %>% rename("lifespan"="lifespan_2022",
+                                   "natural_death"="natural_death_2022")
+
+colnames(trainS)<-sapply(strsplit(colnames(trainS),"\\."),"[[",1)
+colnames(trainS)<-gsub("pct_","p\\.",colnames(trainS))
+colnames(trainS)<-gsub("abs_","n\\.",colnames(trainS))
+colnames(trainS)<-tolower(colnames(trainS))
+colnames(trainS)<-gsub("olid","ID",colnames(trainS))
+
+validateS2<-validate2_harmonized_adj_clumps[All] %>% rename(Sex=sex) %>% 
+  mutate(Project="SLAM") %>% 
+            rename('lifespan'='lifespan_2022',                                                                        'natural_death'='natural_death_2022')
+colnames(validateS2)<-sapply(strsplit(colnames(validateS2),"\\."),"[[",1)
+colnames(validateS2)<-gsub("pct_","p\\.",colnames(validateS2))
+colnames(validateS2)<-gsub("abs_","n\\.",colnames(validateS2))
+colnames(validateS2)<-tolower(colnames(validateS2))
+colnames(validateS2)<-gsub("olid","ID",colnames(validateS2))
+```
+
+
+```{r}
+valdS<-validate_adj_clumps[All_v] %>% rename(Sex=sex) %>% 
+  mutate(Project="SLAM") %>% 
+            rename('lifespan'='lifespan_2022',                                                                        'natural_death'='natural_death_2022')
+valdS<-data.table(valdS)
+colnames(valdS)<-sapply(strsplit(colnames(valdS),"\\."),"[[",1)
+colnames(valdS)<-gsub("pct_","p\\.",colnames(valdS))
+colnames(valdS)<-gsub("abs_","n\\.",colnames(valdS))
+colnames(valdS)<-tolower(colnames(valdS))
+colnames(valdS)<-gsub("olid","ID",colnames(valdS))
+colnames(valdS)<-gsub("_logit","",colnames(valdS))
+colnames(valdS)<-gsub("_log","",colnames(valdS))
+valdS<-data.frame(valdS)
+```
+
+
+```{r}
+trainJ<-trainJ_harmonized_adj_clumps[All_jax] %>% mutate(Project="JAX") 
+colnames(trainJ)<-gsub("\\.adj_clumps","",colnames(trainJ))
+colnames(trainJ)<-gsub("\\.Harmonized","",colnames(trainJ))
+colnames(trainJ)<-tolower(colnames(trainJ))
+colnames(trainJ)<-gsub("clumps","n\\.clumps",colnames(trainJ))
+colnames(trainJ)<-gsub("lymph","lym",colnames(trainJ))
+colnames(trainJ)<-gsub("neut","neuts",colnames(trainJ))
+colnames(trainJ)<-gsub("gluc","glucose",colnames(trainJ))
+colnames(trainJ)<-gsub("olid","ID",colnames(trainJ))
+
+validateJ2<-validateJ2_harmonized_adj_clumps[All_jax] %>% mutate(Project="JAX") 
+colnames(validateJ2)<-gsub("\\.adj_clumps","",colnames(validateJ2))
+colnames(validateJ2)<-gsub("\\.Harmonized","",colnames(validateJ2))
+colnames(validateJ2)<-tolower(colnames(validateJ2))
+colnames(validateJ2)<-gsub("clumps","n\\.clumps",colnames(validateJ2))
+colnames(validateJ2)<-gsub("lymph","lym",colnames(validateJ2))
+colnames(validateJ2)<-gsub("neut","neuts",colnames(validateJ2))
+colnames(validateJ2)<-gsub("gluc","glucose",colnames(validateJ2))
+colnames(validateJ2)<-gsub("olid","ID",colnames(validateJ2))
+
+jx<-gsub(".Harmonized","",All_jax)
+valdJ<-validateJ_adj_clumps[jx] %>% mutate(Project="JAX") 
+colnames(valdJ)<-gsub("\\.adj_clumps","",colnames(valdJ))
+colnames(valdJ)<-gsub("\\.Harmonized","",colnames(valdJ))
+colnames(valdJ)<-tolower(colnames(valdJ))
+colnames(valdJ)<-gsub("clumps","n\\.clumps",colnames(valdJ))
+colnames(valdJ)<-gsub("lymph","lym",colnames(valdJ))
+colnames(valdJ)<-gsub("neut","neuts",colnames(valdJ))
+colnames(valdJ)<-gsub("gluc","glucose",colnames(valdJ))
+colnames(valdJ)<-gsub("olid","ID",colnames(valdJ))
+```
+
+
+```{r}
+trainJ$wave<-as.numeric(trainJ$wave)
+valdJ$wave<-as.numeric(valdJ$wave)
+validateJ2$wave<-as.numeric(validateJ2$wave)
+
+
+trainS$wave<-as.numeric(trainS$wave)
+valdS$wave<-as.numeric(valdS$wave)
+validateS2$wave<-as.numeric(validateS2$wave)
+
+```
+
+
+```{r}
+trainJ$natural_death<-as.numeric(trainJ$natural_death)
+validateJ2$natural_death<-as.numeric(validateJ2$natural_death)
+valdJ$natural_death<-as.numeric(valdJ$natural_death)
+
+trainS$natural_death<-as.numeric(trainS$natural_death)
+validateS2$natural_death<-as.numeric(validateS2$natural_death)
+valdS$natural_death<-as.numeric(valdS$natural_death)
+```
+
+
+```{r}
+train<-rbind(trainJ,trainS)
+vald<-rbind(valdJ,valdS)
+validate2<-rbind(validateJ2,validateS2)
+
+```
+
+
+```{r}
+rm(train_harmonized_adj_clumps,
+   validate2_harmonized_adj_clumps,
+   trainJ_harmonized_adj_clumps,
+   validateJ2_harmonized_adj_clumps,
+   validate_adj_clumps,
+   validateJ_adj_clumps,All_jax,All_v,jx)
+All<-colnames(train)
+Features<-c("rbc","mcv","mch","mchc","chcm","rdw","hdw","mpv","p.lym","n.eos",        
+         "wbc","n.neuts","p.eos","p.mono","plt","glucose","bw") 
+Clumps<-"n.clumps"
+Pheno<-c("sex","cohort","strain")
+train<-train %>% mutate(project=as.factor(project),
+                           strain=as.factor(strain),
+                           wave=as.factor(wave))
+
+vald<-vald %>% mutate(project=as.factor(project),
+                           strain=as.factor(strain),
+                           wave=as.factor(wave))
+
+validate2<-validate2 %>% mutate(project=as.factor(project),
+                           strain=as.factor(strain),
+                           wave=as.factor(wave))
+```
+
+
+```{r, eval=FALSE}
+pa<-paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep="")
+rm(patho)
+save.image(file=pa)
+
+```
+
+
+

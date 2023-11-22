@@ -1,0 +1,236 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
+
+author: "Jorge Martinez-Romero"
+date: "2023-09-28"
+format: html 
+params:
+  sex: "All" # "F", "M", "All". 
+  strain: "All" # "B6", "HET3", "DO", "All"
+  method: "differences" # Calculate age acceleration as the "differences" between predicted age and chronological age or as "residuals" after regresing predicted age on chronological age using a non linear regresssion
+  dataset: "All_held_out" #Select the dataset in where to perform analyses: "All","vald","validate2", "All_held_out","train"
+toc: true   
+self-contained: true  
+---
+
+
+## ACCELERATION COMPARISON BY SEXES AND STRAINS: 
+
+GOAL: Test significant differences on acceleration by strata. 
+
+***
+```{r setup, include=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+## Parameters
+### Parameter explanation.
+- sex: "F".  Select sex: "F", "M", "All".
+- strain: "All".  Select strain: "B6", "HET3", "DO", "All".
+- method: "differences".  Calculate age acceleration as:.
+  - "differences" between predicted age and chronological age or as
+  - "residuals" after regressing predicted age on chronological age
+    using a non linear loess.
+- dataset: "All". Select the dataset in where to perform analyses:
+    "All", "Vald" (Cohort C07 G08) "Validate2" (Pool of cohorts), "All_held_out" (Includes all samples held out during the training process [Vald + Validate2]), "train" (Training set only).
+    
+```{r libraries, echo=TRUE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("ggplot2")
+library("tidyverse")
+library("dplyr")
+library("survival") 
+library("Metrics")
+library("h2o")
+library("data.table")
+library("Metrics")
+library("eha")
+library("kableExtra")
+library("quantreg")
+library("exact2x2")
+library("utils")
+library("LaplacesDemon")
+library("lme4")
+library("DT")
+library("splines")
+
+```
+
+###  Retrieve data and predict
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+```
+
+1)  Function add deltas
+
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+### Select features to add delta (No categoricals)
+
+```{r}
+Features<-c("rbc","mcv","mchc","mch","chcm","hdw"  
+,"wbc","plt","glucose","bw")
+```
+
+------------------------------------------------------------------------
+
+```{r}
+Features
+```
+
+------------------------------------------------------------------------
+
+### Load best DNN after tuning
+
+```{r, echo=TRUE}
+library(h2o)
+h2o.init()
+pat<-paste0(patho,"Models/Models_tunning/DNN_blood_62_N1691016783.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+
+```
+
+### Predict using the best DNN tuned
+```{r}
+train$dataset<-"train"
+validate2$dataset<-"validate2"
+vald$dataset<-"vald"
+data_all<-rbind(train,validate2,vald)
+data_all<-Add_delta_variable(data_all,Features,id="ID")
+Validate <- as.h2o(data_all)
+Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+    Hematology_Based_Age<-as.vector(round(Hematology_Based_Age,digit=0))
+data_all$predicted_age<-Hematology_Based_Age 
+```
+
+Select Dataset to run the analysis according to parameter params$dataset
+
+```{r,warning=FALSE}
+  if(params$dataset == "All_held_out"){
+    data_all<-data_all[data_all$dataset!="train",]}
+  if(params$dataset == "train"){
+    data_all<-data_all[data_all$dataset=="train",]}
+  if(params$dataset == "vald"){
+    data_all<-data_all[data_all$dataset=="vald",]}
+ if(params$dataset == "validate2"){
+    data_all<-data_all[data_all$dataset=="validate2",]}
+```
+
+Select the sex and the strain according to the parameters sex and strain
+
+### Calculate acceleration depending on the method selected
+
+```{r}
+if(params$method=="residuals"){
+  model_loess <- loess(predicted_age~age_wk,data_all)
+  data_all<-data_all%>% tidyr::drop_na() %>% mutate(Acceleration=model_loess$residuals)
+}else{
+  data_all<-data_all%>% tidyr::drop_na() %>% mutate(Acceleration=predicted_age-age_wk)}
+```
+
+
+```{r}
+data_all$`Acceleration(Scaled)`<-scale(data_all$Acceleration)
+ZZS<-ggplot(data = data_all, aes(x = age_wk, y = `Acceleration(Scaled)`, colour = strain))+
+  geom_jitter(alpha=0.2, size=1)+ylim(-3,+3)+ xlim(0,160)+geom_smooth(method = "loess",size=0.2,span=5)+
+  theme(panel.background = element_rect(fill = "white"),
+        legend.position = "bottom",
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 7),
+        panel.border = element_rect(color = "black",
+                                    fill = NA,
+                                    size = 0.5),
+        panel.grid.major = element_line(size = 0.15, linetype = 'solid',
+                                colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'solid',
+                                 colour = "grey"))+
+  
+       xlab("Chronological age (weeks)")+
+  ylab("Age acceleration (scaled)")#+
+  #geom_hline(yintercept = 0, col="grey1")
+ZZS<-ZZS + scale_color_manual(values = c("B6"="skyblue4","HET3"="darkred","DO"="orange4"))
+ZZS
+ggsave(paste0("Acc_strain_",params$dataset,".tiff",sep=""),
+ZZS, device = "tiff",width = 6, height = 6,
+units = c("cm"), dpi = 450)
+```
+```{r}
+data_all$`Acceleration(Scaled)`<-scale(data_all$Acceleration)
+ZZSx<-ggplot(data = data_all, aes(x = age_wk, y = `Acceleration(Scaled)`, colour = sex))+
+  geom_jitter(alpha=0.2, size=1)+ylim(-3,+3)+ xlim(0,160)+geom_smooth(method = "loess",size=0.2, span=5)+
+  theme(panel.background = element_rect(fill = "white"),
+        legend.position = "bottom",
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 7),
+        panel.border = element_rect(color = "black",
+                                    fill = NA,
+                                    size = 0.5),
+        panel.grid.major = element_line(size = 0.15, linetype = 'solid',
+                                colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'solid',
+                                 colour = "grey"))+
+  
+       xlab("Chronological age (weeks)")+
+  ylab("Age acceleration (scaled)")#+
+  #geom_hline(yintercept = 0, col="grey1")
+ZZSx<-ZZSx + scale_color_manual(values = c("F"="pink3","M"="skyblue4"))
+ZZSx
+
+ggsave(paste0(patho,"Acc_sex_",params$dataset,".tiff",sep=""),
+ZZSx, device = "tiff",width = 6, height = 6,
+units = c("cm"), dpi = 450)
+```
+
+## Analysis
+```{r}
+library(lmerTest)
+#include a quadratic term to account for the non-linear relationship
+mo<-lmerTest::lmer(Acceleration~as.factor(sex)+strain+age_wk+I(age_wk^2)+(1|ID)+(1|cohort),data_all)
+summary(mo)
+
+```
+
+```{r}
+data_all$strain2<-data_all$strain
+data_all$strain2 <- factor(data_all$strain2, levels = c("HET3","DO","B6"))
+levels(data_all$strain2)
+```
+
+```{r}
+mo2<-lmerTest::lmer(Acceleration~as.factor(sex)+strain2+age_wk+I(age_wk^2)+(1|ID)+(1|cohort),data_all)
+summary(mo2)
+```
+```{r}
+mo2<-lmerTest::lmer(Acceleration~as.factor(sex)+strain2+age_wk+I(age_wk^2)+(1|ID)+(1|cohort),data_all)
+summary(mo2)
+
+```
+
+```{r}
+ggsave(paste0(patho,"/Plots/Acc_strain_",params$dataset,".tiff",sep=""),
+ZZS, device = "tiff",width = 6, height = 6,
+units = c("cm"), dpi = 450)
+```
+
+```{r}
+ggsave(paste0(patho,"/Plots/Acc_sex_",params$dataset,".tiff",sep=""),
+ZZSx, device = "tiff",width = 6, height = 6,
+units = c("cm"), dpi = 450)
+```
+

@@ -1,0 +1,747 @@
+---
+title: "Hematological Clock 016"
+author: "Jorge Martinez-Romero"
+date: "2023-07-24"
+output: html_document
+---
+
+### -------------------------------------------------------------------------
+### FEATURE IMPORTANCE (FI)
+### -------------------------------------------------------------------------
+
+GOAL: Determine importance assigned by the DNN to each feature
+STRATEGY: Use the DNN 10FCV process including to determine feature importance as per Gedeon's  approach explained in DATA MINING OF INPUTS: ANALYSING MAGNITUDE AND FUNCTIONAL MEASURES Gedeon 1 DOI: 10.1142/s0129065797000227
+-Use the entire dataset( This process is independent of the clock construction)
+-Perform 10FCV using stratified samples for stratified importance.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+
+```
+
+```{r, eval=TRUE}
+#Manually cache
+load(paste0(patho,"Tables/Output/Feature_Importance_DNN_2023_Pltes.Rdata",sep=""))
+rm(pat)
+```
+
+
+### Load packages
+```{r libraries, echo=FALSE, include=FALSE}
+library("dplyr")
+library("h2o")
+library("Metrics")
+library("groupdata2")
+```
+
+
+### Retrieve data
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+rm(pa)
+```
+
+### Load DNN model to extract Feature Importance
+#### DNN built during the model selection process
+```{r}
+h2o.init(nthreads = -1)
+pat<-paste0(patho,"Models/Model_Selection/Models_DNN_ALL_GB_Blood_NoDeltas/DNN_ALL_GB_Blood_NoDeltas_Rep1_N1692292418.zip",sep="")
+
+imported_model <- h2o.import_mojo(pat)
+
+```
+
+#### Ranking
+```{r}
+Ranking<-imported_model@model[["variable_importances"]][1:22,]
+Ranking
+```
+
+Only the 10 biomarkers (exclude sex and strain)
+```{r}
+Features<-c("rbc","mcv","mch","mchc","chcm","hdw","wbc","plt",
+            "glucose","bw") 
+```
+
+### Feature Importance biomarkers
+```{r}
+df<-as.data.frame(t(Ranking))
+colnames(df)<-df[1,]
+df1<-df %>% select(Features)
+df1<-as.data.frame(t(df1))
+Rk<-df1 %>% mutate_if(is.character, as.numeric) %>% round(digits = 3) %>% 
+                  select(-(1:2)) %>% arrange(-percentage)
+rm(df,df1)
+Rk
+
+```
+### Feature importance by age range
+#### Build young-adult-old groups:
+For testing feature importance across Age groups (Age Terciles).
+
+#### Determine the AGE terciles (1=Young, 2=Adult, 3=Old)
+```{r}
+train$dataset<-"train"
+validate2$dataset<-"validate2"
+vald$dataset<-"validate"
+
+ALL<-rbind(train,validate2,vald)
+ALL<-ALL %>% group_by (strain,sex) %>% mutate(age_group=ntile(age_wk,3)) %>% data.frame()
+table(ALL$age_group,ALL$strain)             
+```
+
+Cutting points for Y/A/O
+```{r}
+ALL%>%  
+  group_by(age_group,strain) %>%  ## group this data by the "class" variable
+  summarise_at(vars(age_wk), list(min_age = ~round(min(.),digit=0),max_age = ~round(max(.),digits = 0))) %>% arrange(strain)
+
+```
+
+### Feaure Importance stratified by group, strain and sex
+
+DNN trainnig. 
+
+#### Analysis by Age (YOUNG, ADULTS AND OLD) no strata.
+
+```{r}
+DNN<-function(tr,ts,tv,CV,re,delta,eti,pdtors,Outcome,Pheno){
+  #Factor for groupdata2 split. The package requires the ID to be a factor 
+  tr[,"ID"]<-as.factor(tr[,"ID"])
+  if(delta==1){tr<-Add_delta_variable(tr,Features,id="ID")
+  ts<-Add_delta_variable(ts,Features,id="ID")
+  tv<-Add_delta_variable(tv,Features,id="ID")
+  num<-"_YesDelta"
+  tr[is.na(tr)]=0#Baseline delta to 0 
+  ts[is.na(ts)]=0
+  tv[is.na(tv)]=0
+  
+  Predictors<-c(pdtors,colnames(tr)[grepl("Delta.",colnames(tr))])
+  }else{Predictors<-pdtors
+  num<-"_NoDeltas"}
+  
+  dff<-data.frame(Model=rep(NA,re),R_t=rep(NA,re),
+                 CI1_t=rep(NA,re),CI2_t=rep(NA,re),
+                 Pval_t=rep(NA,re),RMSE_t=rep(NA,re),
+                 MAE_t=rep(NA,re),R_v=rep(NA,re),
+                 CI1_v=rep(NA,re),CI2_v=rep(NA,re),
+                 Pval_v=rep(NA,re),RMSE_v=rep(NA,re),MAE_v=rep(NA,re))
+  
+  folds_df<-as.data.frame(matrix(rep(NA,nrow(tr)*re),ncol = re))
+  colnames(folds_df)<-gsub("V","Repe_",colnames(folds_df)) 
+  tr$ID<-as.factor(as.character(tr$ID))
+  colN<-c(Predictors,Pheno,Outcome,".folds")
+  ts<-ts %>% arrange(ID,wave) %>% as.data.frame()
+  tr<-tr %>% arrange(ID,wave) %>% as.data.frame()
+  tv<-tv %>% arrange(ID,wave) %>% as.data.frame()
+  j<-1  
+  big_list<-list() 
+ 
+  y <- "age_wk"
+  for (j in 1:re){ 
+    folds <- groupdata2::fold(tr, k = CV, id_col ="ID",
+                              cat_col = c('strain','cohort','sex'))
+    folds$sex<-as.factor(folds$sex); ts$sex<-as.factor(ts$sex);tv$sex<-as.factor(tv$sex)
+    trainh2o2 <- as.h2o(folds[,colN])
+    x <- setdiff(setdiff(colnames(trainh2o2),y),".folds")
+    validate <- as.h2o(tv[,setdiff(colN,".folds")]) 
+    validate2 <- as.h2o(ts[,setdiff(colN,".folds")])
+    
+    folds_df[,j]<-as.vector(folds$.folds)
+    rm(folds)
+    model_id<-paste0(eti,num,"_Rep",j,"_N",format(Sys.time(), "%s"),collapse = "_")
+    model_folder<-paste0(patho,"Models/Feature_Importance/Models_",eti,num,collapse = "_")
+    dl_model <- h2o.deeplearning(x = x,
+                                 y = y,
+                                 model_id = model_id,
+                                 training_frame = trainh2o2,
+                                 fold_column=".folds",  
+                                 activation = "RectifierWithDropout",
+                                 score_each_iteration = TRUE,
+                                 stopping_metric = "AUTO",
+                                 stopping_tolerance = 1e-02,
+                                 stopping_rounds = 3,
+                                 keep_cross_validation_predictions = TRUE,
+                                 variable_importances = TRUE
+                                 )
+    Hematology_Based_Age_validate<-h2o.predict(object = dl_model, newdata =validate)
+    Hematology_Based_Age_validate2<-h2o.predict(object = dl_model, newdata =validate2)
+    Hematology_Based_Age_validate<-as.vector(Hematology_Based_Age_validate)
+    Hematology_Based_Age_validate2<-as.vector(Hematology_Based_Age_validate2)
+    
+    r_validate<-cor.test(Hematology_Based_Age_validate,tv$age_wk)
+    r_validate2<-cor.test(Hematology_Based_Age_validate2,ts$age_wk)
+    
+    
+    dff[j,"Model"]<-model_id
+    dff[j,"R_t"]<-round(r_validate2$estimate,digit=2)
+    dff[j,"CI1_t"]<-round(r_validate2$conf.int[[1]],digit=2)
+    dff[j,"CI2_t"]<-round(r_validate2$conf.int[[2]],digit=2)
+    dff[j,"Pval_t"]<-round(r_validate2$p.value,digit=2)
+    dff[j,"RMSE_t"]<-round(rmse(ts$age_wk,Hematology_Based_Age_validate2),digit=2)
+    dff[j,"MAE_t"]<-round(mae(ts$age_wk,Hematology_Based_Age_validate2),digit=2)
+    dff[j,"R_v"]<-round(r_validate$estimate,digit=2)
+    dff[j,"CI1_v"]<-round(r_validate$conf.int[[1]],digit=2)
+    dff[j,"CI2_v"]<-round(r_validate$conf.int[[2]],digit=2)
+    dff[j,"Pval_v"]<-round(r_validate$p.value,digit=2)
+    dff[j,"RMSE_v"]<-round(rmse(tv$age_wk,Hematology_Based_Age_validate),digit=2)
+    dff[j,"MAE_v"]<-round(mae(tv$age_wk,Hematology_Based_Age_validate),digit=2)
+    if(!file.exists(model_folder)){dir.create(model_folder)}
+    mojo_destination <- h2o.save_mojo(dl_model, path = model_folder)
+    big_list[[j]] <- dl_model
+    names(big_list)[[j]] <- model_id
+    print(j)
+  }
+  assign(paste0("List_",model_id,sep=""),big_list, envir = globalenv())
+  assign(paste0("Results_",model_id,sep=""),dff, envir = globalenv())
+  assign(paste0("F10CV_",model_id,sep=""),folds_df, envir = globalenv())
+  return
+}
+```
+
+#### FI young
+```{r,eval=FALSE}
+CVV<-10
+ree<-1
+tra<-ALL %>% filter(dataset=="train" & age_group==1)
+tst<-ALL %>% filter(dataset=="validate2" & age_group==1)
+tvt<-ALL %>% filter(dataset=="validate" & age_group==1)
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_Young",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+#### FI adult
+```{r,eval=FALSE}
+CVV<-10
+ree<-1
+tra<-ALL %>% filter(dataset=="train" & age_group==2)
+tst<-ALL %>% filter(dataset=="validate2" & age_group==2)
+tvt<-ALL %>% filter(dataset=="validate" & age_group==2)
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_Adult",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+### FI old
+```{r,eval=FALSE}
+CVV<-10
+ree<-1
+tra<-ALL %>% filter(dataset=="train" & age_group==3)
+tst<-ALL %>% filter(dataset=="validate2" & age_group==3)
+tvt<-ALL %>% filter(dataset=="validate" & age_group==3)
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_Old",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+
+
+##### Results FI by age
+```{r}
+Young<-as.data.frame(List_DNN_FI_Young_NoDeltas_Rep1_N1694444741[["DNN_FI_Young_NoDeltas_Rep1_N1694444741"]]@model[["variable_importances"]]) 
+
+Adult<-as.data.frame(List_DNN_FI_Adult_NoDeltas_Rep1_N1694444759[["DNN_FI_Adult_NoDeltas_Rep1_N1694444759"]]@model[["variable_importances"]]) 
+
+Old<-as.data.frame(List_DNN_FI_Old_NoDeltas_Rep1_N1694444779[["DNN_FI_Old_NoDeltas_Rep1_N1694444779"]]@model[["variable_importances"]]) 
+
+cleanFI<-function(df){
+    df<-as.data.frame(t(df))
+    colnames(df)<-df[1,]
+    df1<-df %>% select(Features)
+    df1<-as.data.frame(t(df1))
+    df1<-df1 %>% mutate_if(is.character, as.numeric) %>% round(digits = 3) 
+    df1[,1]<-rownames(df1)
+    df1<-df1 %>%  select(-(2:3)) %>% arrange(variable)
+    #colnames(df1)[2]<-as.character(eti)
+}
+
+FI_Young<-cleanFI(Young)
+FI_Adult<-cleanFI(Adult)
+FI_Old<-cleanFI(Old)
+colnames(FI_Young)[2]<-"Young"
+colnames(FI_Adult)[2]<-"Adult"
+colnames(FI_Old)[2]<-"Old"
+
+
+FI_strat_YAO<-cbind(FI_Young,FI_Adult,FI_Old)
+FI_strat_YAO<-FI_strat_YAO[,-c(1,3,5)]
+FI_strat_YAO
+```
+
+#### Analysis by sex-age
+
+Females
+```{r,eval=FALSE}
+CVV<-10
+ree<-1
+
+tra<-ALL %>% filter(dataset=="train" & age_group==1 & sex =="F")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==1 & sex =="F")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==1 & sex =="F")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_F_Young",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+tra<-ALL %>% filter(dataset=="train" & age_group==2 & sex =="F")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==2 & sex =="F")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==2 & sex =="F")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_F_Adult",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+
+tra<-ALL %>% filter(dataset=="train" & age_group==3 & sex =="F")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==3 & sex =="F")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==3 & sex =="F")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_F_Old",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+```
+
+Males
+```{r,eval=FALSE}
+CVV<-10
+ree<-1
+
+tra<-ALL %>% filter(dataset=="train" & age_group==1 & sex =="M")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==1 & sex =="M")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==1 & sex =="M")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_M_Young",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+tra<-ALL %>% filter(dataset=="train" & age_group==2 & sex =="M")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==2 & sex =="M")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==2 & sex =="M")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_M_Adult",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+
+tra<-ALL %>% filter(dataset=="train" & age_group==3 & sex =="M")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==3 & sex =="M")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==3 & sex =="M")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_M_Old",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+##### Results FI by sex-age
+###### Females
+```{r}
+YoungF<-as.data.frame(List_DNN_FI_F_Young_NoDeltas_Rep1_N1694445506[["DNN_FI_F_Young_NoDeltas_Rep1_N1694445506"]]@model[["variable_importances"]]) 
+
+AdultF<-as.data.frame(List_DNN_FI_F_Adult_NoDeltas_Rep1_N1694445514[["DNN_FI_F_Adult_NoDeltas_Rep1_N1694445514"]]@model[["variable_importances"]]) 
+
+OldF<-as.data.frame(List_DNN_FI_F_Old_NoDeltas_Rep1_N1694445521[["DNN_FI_F_Old_NoDeltas_Rep1_N1694445521"]]@model[["variable_importances"]]) 
+
+
+FI_YoungF<-cleanFI(YoungF)
+FI_AdultF<-cleanFI(AdultF)
+FI_OldF<-cleanFI(OldF)
+colnames(FI_YoungF)[2]<-"Young"
+colnames(FI_AdultF)[2]<-"Adult"
+colnames(FI_OldF)[2]<-"Old"
+
+
+FI_strat_YAO_F<-cbind(FI_YoungF,FI_AdultF,FI_OldF)
+FI_strat_YAO_F<-FI_strat_YAO_F[,-c(1,3,5)]
+FI_strat_YAO_F
+```
+
+
+###### Males
+```{r}
+YoungM<-as.data.frame(List_DNN_FI_M_Young_NoDeltas_Rep1_N1694445534[["DNN_FI_M_Young_NoDeltas_Rep1_N1694445534"]]@model[["variable_importances"]]) 
+
+AdultM<-as.data.frame(List_DNN_FI_M_Adult_NoDeltas_Rep1_N1694445541[["DNN_FI_M_Adult_NoDeltas_Rep1_N1694445541"]]@model[["variable_importances"]]) 
+
+OldM<-as.data.frame(List_DNN_FI_M_Old_NoDeltas_Rep1_N1694445547[["DNN_FI_M_Old_NoDeltas_Rep1_N1694445547"]]@model[["variable_importances"]]) 
+
+
+FI_YoungM<-cleanFI(YoungM)
+FI_AdultM<-cleanFI(AdultM)
+FI_OldM<-cleanFI(OldM)
+colnames(FI_YoungM)[2]<-"Young"
+colnames(FI_AdultM)[2]<-"Adult"
+colnames(FI_OldM)[2]<-"Old"
+
+
+FI_strat_YAO_M<-cbind(FI_YoungM,FI_AdultF,FI_OldM)
+FI_strat_YAO_M<-FI_strat_YAO_M[,-c(1,3,5)]
+FI_strat_YAO_M
+```
+
+
+
+
+#### Analysis by Strain
+
+B6
+```{r,eval=FALSE}
+CVV<-10
+ree<-1
+
+tra<-ALL %>% filter(dataset=="train" & age_group==1 & strain =="B6")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==1 & strain =="B6")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==1 & strain =="B6")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_B6_Young",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+tra<-ALL %>% filter(dataset=="train" & age_group==2 & strain =="B6")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==2 & strain =="B6")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==2 & strain =="B6")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_B6_Adult",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+
+tra<-ALL %>% filter(dataset=="train" & age_group==3 & strain =="B6")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==3 & strain =="B6")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==3 & strain =="B6")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_B6_Old",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+HET3
+```{r,eval=FALSE}
+CVV<-10
+ree<-1
+
+tra<-ALL %>% filter(dataset=="train" & age_group==1 & strain =="HET3")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==1 & strain =="HET3")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==1 & strain =="HET3")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_HET3_Young",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+tra<-ALL %>% filter(dataset=="train" & age_group==2 & strain =="HET3")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==2 & strain =="HET3")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==2 & strain =="HET3")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_HET3_Adult",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+
+tra<-ALL %>% filter(dataset=="train" & age_group==3 & strain =="HET3")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==3 & strain =="HET3")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==3 & strain =="HET3")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_HET3_Old",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+DO
+```{r,eval=FALSE}
+CVV<-10
+ree<-1
+
+tra<-ALL %>% filter(dataset=="train" & age_group==1 & strain =="DO")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==1 & strain =="DO")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==1 & strain =="DO")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_DO_Young",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+tra<-ALL %>% filter(dataset=="train" & age_group==2 & strain =="DO")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==2 & strain =="DO")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==2 & strain =="DO")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_DO_Adult",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+
+
+tra<-ALL %>% filter(dataset=="train" & age_group==3 & strain =="DO")
+tst<-ALL %>% filter(dataset=="validate2" & age_group==3 & strain =="DO")
+tvt<-ALL %>% filter(dataset=="validate" & age_group==3 & strain =="DO")
+DNN(tr=tra,ts=tst,tv=tvt,CV=CVV,re=ree,
+       delta=0,
+       eti="DNN_FI_DO_Old",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+
+
+
+##### Results FI by strain-age
+###### B6
+
+```{r}
+YoungB<-as.data.frame(List_DNN_FI_B6_Young_NoDeltas_Rep1_N1694445685[["DNN_FI_B6_Young_NoDeltas_Rep1_N1694445685"]]@model[["variable_importances"]]) 
+
+AdultB<-as.data.frame(List_DNN_FI_B6_Adult_NoDeltas_Rep1_N1694445692[["DNN_FI_B6_Adult_NoDeltas_Rep1_N1694445692"]]@model[["variable_importances"]]) 
+
+OldB<-as.data.frame(List_DNN_FI_B6_Old_NoDeltas_Rep1_N1694445699[["DNN_FI_B6_Old_NoDeltas_Rep1_N1694445699"]]@model[["variable_importances"]]) 
+
+
+FI_YoungB<-cleanFI(YoungB)
+FI_AdultB<-cleanFI(AdultB)
+FI_OldB<-cleanFI(OldB)
+colnames(FI_YoungB)[2]<-"Young"
+colnames(FI_AdultB)[2]<-"Adult"
+colnames(FI_OldB)[2]<-"Old"
+
+
+FI_strat_YAO_B<-cbind(FI_YoungB,FI_AdultB,FI_OldB)
+FI_strat_YAO_B<-FI_strat_YAO_B[,-c(1,3,5)]
+FI_strat_YAO_B
+```
+
+###### HET3
+
+```{r}
+YoungH<-as.data.frame(List_DNN_FI_HET3_Young_NoDeltas_Rep1_N1694445717[["DNN_FI_HET3_Young_NoDeltas_Rep1_N1694445717"]]@model[["variable_importances"]]) 
+
+AdultH<-as.data.frame(List_DNN_FI_HET3_Adult_NoDeltas_Rep1_N1694445723[["DNN_FI_HET3_Adult_NoDeltas_Rep1_N1694445723"]]@model[["variable_importances"]]) 
+
+OldH<-as.data.frame(List_DNN_FI_HET3_Old_NoDeltas_Rep1_N1694445730[["DNN_FI_HET3_Old_NoDeltas_Rep1_N1694445730"]]@model[["variable_importances"]]) 
+
+
+FI_YoungH<-cleanFI(YoungH)
+FI_AdultH<-cleanFI(AdultH)
+FI_OldH<-cleanFI(OldH)
+colnames(FI_YoungH)[2]<-"Young"
+colnames(FI_AdultH)[2]<-"Adult"
+colnames(FI_OldH)[2]<-"Old"
+
+
+FI_strat_YAO_H<-cbind(FI_YoungH,FI_AdultH,FI_OldH)
+FI_strat_YAO_H<-FI_strat_YAO_H[,-c(1,3,5)]
+FI_strat_YAO_H
+```
+
+
+###### DO
+
+```{r}
+YoungD<-as.data.frame(List_DNN_FI_DO_Young_NoDeltas_Rep1_N1694445756[["DNN_FI_DO_Young_NoDeltas_Rep1_N1694445756"]]@model[["variable_importances"]]) 
+
+AdultD<-as.data.frame(List_DNN_FI_DO_Adult_NoDeltas_Rep1_N1694445762[["DNN_FI_DO_Adult_NoDeltas_Rep1_N1694445762"]]@model[["variable_importances"]]) 
+
+OldD<-as.data.frame(List_DNN_FI_DO_Old_NoDeltas_Rep1_N1694445767[["DNN_FI_DO_Old_NoDeltas_Rep1_N1694445767"]]@model[["variable_importances"]]) 
+
+
+FI_YoungD<-cleanFI(YoungD)
+FI_AdultD<-cleanFI(AdultD)
+FI_OldD<-cleanFI(OldD)
+colnames(FI_YoungD)[2]<-"Young"
+colnames(FI_AdultD)[2]<-"Adult"
+colnames(FI_OldD)[2]<-"Old"
+
+
+FI_strat_YAO_D<-cbind(FI_YoungD,FI_AdultD,FI_OldD)
+FI_strat_YAO_D<-FI_strat_YAO_D[,-c(1,3,5)]
+FI_strat_YAO_D
+```
+
+```{r}
+#clean
+rm(tra,tst,tvt,df1,df)
+```
+
+
+#### Best Predictor Analyis Platelets analysis
+
+```{r}
+#Pull out Platelets up to 84 weeks (Maximun age in JAX)
+Plate_SLAM<-SLAM_RAW[,c("idno","sex","strain","PLT","Age_wk")] %>% filter(Age_wk<=84) %>% mutate(plt=PLT,Sex=sex) %>% select(!c(PLT,sex))
+Plate_JAX<-JAX_RAW[,c("idno","Sex","plt","Age_wk")] 
+Plate_JAX$strain<-"DO"
+Platelets<-data.frame(rbind(Plate_SLAM,Plate_JAX));
+rm(Plate_JAX,Plate_SLAM)
+#Average Platelets by ID
+meansPlateletsID<-aggregate(plt~idno+Sex+strain,mean,data=Platelets)
+Mean<-aggregate(plt~Sex+strain,mean,data=meansPlateletsID)
+sd<-meansPlateletsID %>% group_by(Sex,strain) %>% summarise(sd=sd(plt))
+Mean$sd<-sd$sd
+Mean
+```
+
+```{r}
+
+
+meansPlateletsID<-meansPlateletsID %>% mutate(SexStrain=paste(Sex,strain,sep="_"))
+meansPlateletsID <- meansPlateletsID %>%
+  mutate(across(where(is.character), as.factor))
+```
+
+
+```{r}
+library(ggplot2)
+
+custom_colors <- c("4" = "red", "6" = "blue", "8" = "green")
+
+
+p<-ggplot(meansPlateletsID, aes(x = plt, fill = Sex)) +
+  geom_density(alpha = 0.7,size=0.3) + xlim(-200,3200)+
+  labs(subtitle = "Density Plot by Sex", x = "Platelet counts") +
+  scale_fill_manual(values=c("pink","skyblue4"))+
+  theme_linedraw()+
+  theme(legend.position = "bottom",
+  legend.text = element_text(family = "Arial", size = 7),
+  legend.title = element_text(family = "Arial", size = 7),
+  legend.key.height = unit(0.25,"cm"),
+  axis.text.x = element_text(size = 6),  
+  axis.text.y = element_text(size = 5), 
+  plot.subtitle = element_text(size = 7),
+  axis.title.x = element_text(family = "Arial", size = 6),
+  axis.title.y = element_text(family = "Arial", size = 6))
+p
+ggsave(paste(patho,"Plots/Platelets.tiff",sep=""),
+p, device = "tiff", width = 6, height = 6,
+  units = c("cm"),dpi = 450)
+
+```
+
+```{r}
+p<-ggplot(meansPlateletsID, aes(x = plt, fill = strain)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot by Strain", x = "Platelets counts") +
+  scale_fill_discrete(name = "Group")+theme_linedraw()
+p
+
+```
+
+
+
+
+
+```{r}
+p<-ggplot(meansPlateletsID, aes(x = plt, fill = SexStrain)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot by Strain", x = "Platelets counts") +
+  scale_fill_discrete(name = "Group")+theme_linedraw()
+p
+```
+
+
+
+
+
+```{r}
+library(ggplot2)
+p<-ggplot(meansPlateletsID, aes(x = plt, fill = Sex)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot by Sex and Strain", x = "Platelets counts") +
+  scale_fill_discrete(name = "Group")+theme_linedraw()
+p
+```
+
+```{r}
+# Perform pairwise t-tests
+t_test_results <- pairwise.wilcox.test(meansPlateletsID$plt, meansPlateletsID$strain, p.adjust.method = "BH")
+
+t_test_results2 <- pairwise.wilcox.test(meansPlateletsID$plt, meansPlateletsID$Sex, p.adjust.method = "none")
+
+t_test_results3 <- pairwise.wilcox.test(meansPlateletsID$plt, meansPlateletsID$SexStrain, p.adjust.method = "BH")
+
+t_test_results
+t_test_results2
+t_test_results3
+```
+
+### Plot trajectories all phisiological predictors  
+
+```{r}
+data<-rbind(train,vald,validate2)
+data2<-as.data.frame(sapply(data[,Features], exp))
+data2$Age<-as.vector(data$age_wk)
+data2$Sex<-as.vector(data$sex)
+data3<-reshape2::melt(data2,id=c("Age","Sex")) %>% 
+  mutate(variable = factor(variable,
+                   levels=c("bw","chcm","glucose","hdw","mch",     "mchc","mcv","plt","rbc","wbc")))
+
+#plot<-function (col){ Observ<-dim(data)[1]
+#col<-data2$rbc
+K2<-ggplot(data3, aes(x = Age, y=value, color=Sex))+         
+          xlab("Chronological age (weeks)") +  ylab("Feature")+
+  geom_point(aes(col=Sex),size=1,alpha = 0.05)+
+          stat_smooth(method = "loess", span = 7,level = 0.999,fullrange = TRUE, size=1)+
+          geom_vline(xintercept = 52, col = "black", size=0.2)+ 
+  geom_vline(xintercept = 108, col = "black", size=0.2)+ 
+  scale_color_manual(values=c(F="pink2",M="skyblue4"))+
+     theme(panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        legend.position="bottom",
+        strip.background = element_rect(color ="black",size = 0.4),
+        axis.title = element_text(size = 7),
+         legend.title=element_text(size=6), 
+         legend.text=element_text(size=5),
+        panel.border = element_rect(color = "black",
+                                    fill = NA,
+                                    size = 0.5),
+        panel.grid.major = element_line(size = 0.15, linetype = 'solid',
+                                colour = "grey"), 
+        panel.grid.minor = element_line(size = 0.15, linetype = 'solid',
+                                 colour = "grey"),
+        plot.margin = margin(0.5,0.5,0.5,0.5, "cm"))+
+        facet_wrap(~variable,scales = "free",ncol = 5, nrow=2)
+  
+library(grid)
+
+q <- ggplotGrob(K2)
+
+lg <- linesGrob(x=unit(c(1,0),"npc"), y=unit(c(1,1),"npc"), gp=gpar(col="white", lwd=1))
+
+for (k in grep("strip-t",q$layout$name)) {
+  q$grobs[[k]]$grobs[[1]]$children[[1]] <- lg
+}
+
+grid.draw(q) 
+
+ggsave(paste0(patho,"Plots/Feat_All_mice.tiff",sep=""),
+q, device = "tiff", width = 18, height = 10,
+  units = c("cm"),dpi = 450)
+
+```
+
+## Save
+
+```{r eval=FALSE}
+save.image(paste0(patho,"Tables/Output/Feature_Importance_DNN_2023_Pltes.Rdata",sep=""))
+```
+
+
+

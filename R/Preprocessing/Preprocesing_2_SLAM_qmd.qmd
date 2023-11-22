@@ -1,0 +1,954 @@
+---
+title: "Hematological Clock 016" 
+subtitle: "(Method to imput missingness:`r params$imput_missingness`) "
+author: "Jorge Martinez-Romero"
+date: "2023-07-28"
+format: html 
+params:
+  impute_missingness: "Mean" # "Mean","Spline","MissForest" 
+toc: true   
+self-contained: true  
+---
+
+
+### ------------------------------------------------------------------
+### PREPROCESSING SLAM DATASET  (2nd PART)  
+### ------------------------------------------------------------------
+
+## Parameters
+### Parameters explanation.
+- impute_missingness: "Mean"(Default),"Spline","MissForest".
+  - Mean: Impute mean value by time point, sex, and strain. 
+  - Spline: Impute using a spline by individual to predict the missing value.
+  - MissForest: Impute using Random Forest including categorical variables.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+
+```
+
+```{r libraries, echo=FALSE, include=FALSE}
+library("tidyverse")
+library("rio") 
+library("readODS")
+library("readxl")
+library("magrittr")
+source(paste0(patho,"/Utilities/merge_Vble.R",sep=""))
+library("groupdata2")
+library("zoo")
+library("missForest")
+```
+
+#### Retrive datasets and select vbles
+```{r Retrieve Advia}
+data <- readRDS(paste0(patho,"Tables/Transitions/Census_Advia_BW_GLU_processed_2022-08-13.rds",sep=""))
+BW <- rio::import(paste0(patho,"Tables/Source/BW_Temp_FC_All_detailed_2021-01-25.csv",sep=""))
+Glu <- rio::import(paste0(patho,"Tables/Source/SLAM C1-C10 Glucose-Lactate Values.csv",sep=""))
+```
+
+##### Define readable features 
+As per Advia 2120 Operator's Guide page 1-22. (data)
+```{r Features, echo=FALSE}
+Features <- c(
+"RBC(x10E06 cells/µL)"        ,"measHGB(g/dL)"               ,"HCT(%)"   ,    "%LUC(%)", 
+"MCV(fL)"                     ,"MCH(pg)"                     ,"MCHC(g/dL)"  , "PDW(%)",
+"CHCM(g/dL)"                  ,"RDW(%)"                      ,"HDW(g/dL)" ,   "PCT(%)",
+"PLT(x10E03 cells/µL)"        ,"MPV(fL)"                     ,"%LYM(%)"   ,   "mature_CHDW(pg)",
+"%MONO(%)"                    ,"%EOS(%)"                     ,"%NEUT(%)"  ,
+"%BASO(%)"                    ,"abs_neuts(x10E03 cells/µL)"  ,"abs_lymphs(x10E03 cells/µL)",
+"abs_monos(x10E03 cells/µL)"  ,"abs_eos(x10E03 cells/µL)"    ,"abs_lucs(x10E03 cells/µL)",  
+"abs_basos(x10E03 cells/µL)"  ,"#Retic(x10E09 cells/L)"      ,"%Retic(%)" , 
+"MCVg(fL)"                    ,"CHCMg(g/dL)"                 ,"CHg(pg)" , 
+"WBC(x10E03 cells/µL)"        ,"reticCHCM(g/dL)",             "retic_MCV(fL)")
+
+data<-data %>% select(-"Age_wk")#Lifespan duplicated in Age_wk. Already have lifespan variable
+data<-data %>% rename(Age_wk=age_at_assy)#Don not correct: It is the variable-name used in all models tested. 
+Pheno <- c("cohort", "sex" ,   "strain")
+Datess <- c("dob" ,     "Died",     "Date_assy")
+Outcms <- c("lifespan", "remain", "status", "natural_death","Age_wk")
+Metabol <- c("Glucose", "bw")
+Clumps<- c("# Plt Clumps")
+IDs<-c("Identifier")
+Vbles<-c(IDs,Pheno,Outcms,Features,Metabol,Clumps,Datess)
+data<-data[,Vbles]
+data<-data %>% rename(idno = Identifier) %>%   #Identifier to idno in all analysis bellow
+rename(date=Date_assy) #Date_assy to date in all analysis bellow
+rm(Vbles)
+
+```
+
+
+#### Update mortality information to Aug 2022. 
+At the beginning of this analysis some animals (cohort 10) were still alive. Date of death updated. All animals death by Aug 2022
+
+```{r}
+mortal22<- read_csv(paste(patho,"Tables/Source/survival_2022-08-15.csv",sep=""),show_col_types = FALSE) %>% mutate(idno=as.character(idno))
+data<-data %>% left_join(select(mortal22,c(idno,tod,lifespan,cod,dead_censor_nat)),by="idno",keep=FALSE) %>% rename(lifespan_2022=lifespan.y,natural_death_2022=dead_censor_nat, lifespan=lifespan.x)
+# Updated animals with natural death: "571"  "778"  "1199" "2072" "2163"
+# Animal 2072 and 2163 with extremely long lifespan (3.92 years) -> censor
+```
+
+#### Duplicates
+Identify records with more than one test, same day, same animal ID
+```{r}
+Duplicated<-data %>% tibble::rownames_to_column(., "Row") %>% 
+  group_by(idno,date) %>% 
+  filter(n()>1)
+  Duplicated[,c("Row","idno","date",Features)]
+
+```
+Strategy: Remove or merge tests performed same day on same mouse.
+Cause: Some test repeated due to errors in protocol or equipment. Other tests repeated by the laboratory operator. 
+Goal: Keep as much information as possible and remove those test erroneous.
+Removing Criteria: Based on the RBC variable (normally distributed). 
+If both RBC measures are similar keep both records. Then merge into one mean value per day. (Similar = means within the range 'mean-RBC +/- 2 SD')
+If both RBC are dissimilar, keep the record falling in the range 'mean-RBC +/- 2 SD', remove the other test.
+```{r}
+mm<-mean(Duplicated$`RBC(x10E06 cells/µL)`)
+ss<-sd(Duplicated$`RBC(x10E06 cells/µL)`)#1,33,50,51,57,59,
+SD_up<-mm+2*ss
+SD_dw<-mm-2*ss
+cat("Range to keep the record: RBC within", SD_dw, "and", SD_up)
+```
+
+
+Flag records off the range:
+```{r}
+Remove<-Duplicated[c(1,33,50,51,57,59,117),c("Row","idno","date","RBC(x10E06 cells/µL)")]
+Remove
+```
+
+Remove records duplicated and not within the range
+```{r}
+dupes<-Remove$Row
+`%!in%` = Negate(`%in%`)
+data<-data %>% filter(row.names(data) %!in% dupes)
+```
+
+
+Aggregate measures of same animal and same day into a mean value
+Clean column names (data2)
+```{r echo=FALSE, warning=FALSE}
+sum_id_date <-data%>%
+  group_by(idno, date) %>%
+  summarise(across(all_of(c(Features,Clumps)), ~ mean(.))) %>% 
+  mutate(across(where(is.numeric), round, 2))
+
+data2<-data %>% distinct(idno,date, .keep_all = TRUE)
+data2<-left_join(data2,sum_id_date,by = c("idno","date"), keep = FALSE ) #
+data2<-data2 %>% select(!ends_with(".y")) %>% rename("abs_clumps"="# Plt Clumps.x")             
+col_ne<-colnames(data2)
+
+col_ne<-gsub("#","abs_",col_ne)
+col_ne<-gsub(" ","_",col_ne)
+col_ne<-gsub("(\\(.+\\)\\.x)","",col_ne)
+col_ne<-gsub("%","pct_",col_ne)
+```
+
+### Keep overlapped features in both studies (SLAM-JAX)
+```{r echo=FALSE, warning=FALSE}
+colnames(data2)<-col_ne
+# Features_short<-c("RBC","measHGB","HCT","MCV",
+#                 "MCH","MCHC","CHCM","RDW",
+#                 "HDW","PLT","MPV","pct_LYM",
+#                 "pct_MONO","pct_EOS","pct_NEUT","pct_BASO", "pct_LUC",
+#                 "abs_neuts","abs_lymphs","abs_monos","abs_eos",
+#                 "abs_lucs","abs_basos","abs_Retic","pct_Retic",
+#                 "MCVg","CHCMg","CHg","WBC",
+#                 "retic_MCV","reticCHCM")
+
+Features_short<-c(
+ "RBC"                ,"measHGB"            ,"HCT",               
+ "pct_LUC"            ,"MCV"                ,"MCH",               "MCHC",              
+ "PDW"                ,"CHCM"               ,"RDW",               "HDW",               
+ "PCT"                ,"PLT"                ,"MPV",               "pct_LYM",           
+ "mature_CHDW"        ,"pct_MONO"           ,"pct_EOS",           "pct_NEUT",          
+ "pct_BASO"           ,"abs_neuts"          ,"abs_lymphs",        "abs_monos",         
+ "abs_eos"            ,"abs_lucs"           ,"abs_basos",         "abs_Retic",         
+ "pct_Retic"          ,"MCVg"               ,"CHCMg",             "CHg",               
+ "WBC"                ,"reticCHCM"          ,"retic_MCV")       
+
+
+
+
+
+
+
+
+Clumps<-c("abs_clumps")#plt clumps
+All_vb<-c(Features_short,Metabol)
+
+rm(sum_id_date,col_ne,Features)
+
+```
+#### Add glucose and body weight
+Strategy to merge columns:
+Merge_Vble: Function to search in the Body-Weight dataset and match 
+[id-animal plus BW-date] with [id-animal plus bleed-date]. 
+A window in weeks is required (window = +/- 2 weeks)
+If no match date is found (BW-date +/- 2 weeks) insert NA in data2$bw,
+otherwise insert closest BW in data2$bw.
+
+#### Merge BW
+```{r add_bw2}
+data2<-data2 %>% rename("bw_ui"="bw")# Rename old-bw to bw-university-indiana
+BW<-BW %>% select("date","bw","idno")# New-bw will be stored in variable bw 
+BW$idno<-as.character(BW$idno)
+window <-2 #in weeks
+data3<-merge_Vble(
+  data2,BW,
+  id="idno",
+  date="date",
+  threshold = c(weeks = window),
+  vars = "bw",
+  where = "both",
+  suffixes = c(".Advia", ".bw"), #Ad:Advia and bw: Body weight
+  clean_vars = TRUE
+)
+rm(window)
+#data3<-data3 %>% rename(bw=bw.bw)
+IDs<-"idno"# idno used as identifier in all analysis 
+data3[which(data3$bw==""),'bw']<-NA #Change spaces to NAs
+data3$bw<-as.numeric(data3$bw) 
+data3$bw_ui<-as.numeric(data3$bw_ui)
+
+```
+
+#### Merge Glucose
+Same strategy as above
+```{r}
+library(data.table)
+data4<-data3 %>% rename("Glucose_ui"="Glucose")# Rename old-Glucose to Glucose-university-indiana
+data4<-data4 %>% rename("date"="date.Advia") %>% dplyr::select(-dif_weeks)
+Gl<-Glu %>% select("date","Glucose","idno")# New-Glucose will be stored in variable Glucose 
+Gl$idno<-as.character(Gl$idno)
+Gl$date<-as.Date(Gl$date,format ="%m/%d/%Y")
+Gl$date<-as.IDate(Gl$date)#format data.table for the function
+window <-2 #in weeks
+data4<-merge_Vble(
+  data4,Gl,
+  id="idno",
+  date="date",
+  threshold = c(weeks = window),
+  vars = "Glucose",
+  where = "both",
+  suffixes = c(".Advia", ".glu"), #Ad:Advia and bw: Body weight
+  clean_vars = TRUE
+)
+data4<-data4 %>% rename("date.bw"="date.Advia.bw")
+rm(window)
+data4[which(data4$Glucose==""),'Glucose']<-NA #Change spaces to NAs
+data4$Glucose<-as.numeric(data4$Glucose) 
+data4$Glucose_ui<-as.numeric(data4$Glucose_ui)
+
+```
+#### Low counts due to 1/4 blood dilution
+
+Low cell-populations detected (aspiration,dilution RPMI 1/4). Detected WBC, RBC, Neutrophils, Monocytes populations with values equals to zero. 
+Strategie to tackle the issue: 
+1) CBC: WBC or RBC= 0, remove samples from study.
+2) WBC differentials: If variable shows more than 70% zeros, remove variable from study.
+3) Variables with less than 70%-zeroes, transform zeroes into 1/2 min value detected.
+
+1) Remove samples with RBC or WBC = zero (data3)
+```{r}
+err_a<-which(data4$RBC==0 | data4$WBC==0)
+data4[err_a, c("idno","RBC", "WBC") ]
+removed_apiration_error<- data4[err_a, ]
+data4<- data4[-err_a, ]
+```
+
+2) Remove samples zero counts due to dilution (data3)
+Zero frequencies: abs_basos and pct_BASO removed from study due to too many zeroes (7,820 zeroes [71%])
+```{r}
+#clean variables
+Features_short<-setdiff(Features_short,c("abs_basos","pct_BASO"))
+```
+
+
+3) Set zeroes to '1/2 min value detected'
+"pct_LYM","pct_MONO","pct_EOS","pct_NEUT","pct_LUC","abs_neuts",
+"abs_lymphs","abs_monos","abs_eos","abs_lucs", "abs_clumps".
+
+```{r}
+neu_mon<-c("pct_LYM","pct_MONO","pct_EOS","pct_NEUT","pct_LUC","abs_neuts",
+"abs_lymphs","abs_monos","abs_eos","abs_lucs","abs_clumps")
+
+
+data4[neu_mon] <- 
+lapply(data4[neu_mon] , function(x) replace(x, x == 0, min(x[x>0], na.rm = TRUE)/2))
+
+```
+
+
+
+#### Plot densities before transformation
+```{r}
+All_vb<-c(Features_short,Metabol,Clumps)
+ggplot(reshape2::melt(data4[,All_vb], key = "variable", value = "value"), aes(value)) +
+  geom_density() +
+  theme(panel.background = element_rect(fill = "wheat"))+
+  facet_wrap(~variable, scales = "free")
+```
+
+Remove dilution factor 1/4 from SLAM-study samples for later merge with JAX-study samples not diluted. 
+```{r}
+ #remove dilution factor 1/4 only in SLAM (TRAIN+validate2)
+  diluted<-c("RBC","PLT","WBC","abs_neuts","abs_lymphs","abs_monos","abs_eos","abs_lucs",  
+"abs_Retic","HCT","measHGB")
+  SLAM_RAW<-data4 %>% 
+    mutate_at(vars(all_of(diluted)),
+              .funs = funs(. * 4))
+    data4<-data4 %>% 
+    mutate_at(vars(all_of(diluted)),
+              .funs = funs(. * 4))
+  
+```
+
+#### Transformations
+Transform percentages to logit
+```{r}
+library(LaplacesDemon)
+data4<-data4
+# p <- invlogit(x)
+# x <- logit(p)
+
+pctes<-c("pct_LYM","pct_MONO","pct_EOS","pct_NEUT","pct_LUC","pct_Retic")
+rest<-c(setdiff(Features_short,pctes),Metabol,Clumps)
+data4[pctes]<-sapply(data4[pctes] , function(x) ifelse(is.na(x),NA,logit(x/100)))
+
+```
+
+
+Transform remaining features to log 
+```{r}
+data4$MCVg<-as.numeric(data4$MCVg)
+data4$CHCMg<-as.numeric(data4$CHCMg)
+data4$CHg<-as.numeric(data4$CHg)
+data4$retic_MCV<-as.numeric(data4$retic_MCV)
+data4$reticCHCM<-as.numeric(data4$reticCHCM)
+
+data4[rest]<-sapply(data4[rest] , function(x) ifelse(is.na(x),NA,log(x)))
+```
+
+
+Plot densities after variable-transformation including outliers
+```{r}
+All_vb<-c(Features_short,Metabol,Clumps)
+ggplot(reshape2::melt(data4[,All_vb], key = "variable", value = "value"), aes(value)) +
+  geom_density() +
+  theme(panel.background = element_rect(fill = "wheat"))+
+  facet_wrap(~variable, scales = "free")
+rm(ALL_vb)
+```
+#### Outliers
+
+Remove outliers (1.5 x IQR) function (data5)
+
+```{r,echo=FALSE }
+check_outlier <- function(v, coef=1.5){
+  quantiles <- quantile(v,probs=c(0.25,0.75),na.rm=T)
+  IQR <- quantiles[2]-quantiles[1]
+  res <- v < (quantiles[1]-coef*IQR)|v > (quantiles[2]+coef*IQR)
+  return(res)
+}
+```
+
+
+```{r Remove outliers,echo=FALSE }
+datax<-data.table(data4)
+all<-c(Features_short,Metabol,Clumps)
+non_normal<-c("pct_LUC","abs_monos","abs_eos","abs_lucs")
+all<-setdiff(all,non_normal) 
+for (i in 1:length(all)){
+    x<-all[i]
+    variable <-paste0("out_",x)
+    datax[,outlier:= check_outlier (get(x)),by = c("strain","sex")]
+    datax[,label:=ifelse(outlier,datax[,get(x)],"")]
+    datax[datax$outlier==TRUE,x]<-NA
+    datax<-datax %>% rename(!!variable :=  "label") %>% select(-outlier) 
+    }
+datax<-as.data.frame(datax)
+data5<-datax[,1:58]
+```
+
+
+#### Plot densities after outliers removing 
+(data5)
+```{r}
+
+ggplot(reshape2::melt(data5[,All_vb], key = "variable", value = "value"), aes(value)) +
+  geom_density() +
+  theme(panel.background = element_rect(fill = "wheat"))+
+  facet_wrap(~variable, scales = "free")
+```
+
+
+```{r}
+
+Blood<-Features_short; rm(Features_short)
+All_Features<-c(Blood,Metabol)
+
+rm("All_vb","BW",'Gl',"Glu","Datess","dupes","Duplicated","Features_short", "pctes",
+"err_a","mm","moon","neu_mon","Remove","remove_outliers" ,        "removed_apiration_error","rest","SD_dw","SD_up","ss")
+```
+
+#### Wave variable
+Add the wave variable and transform variables to factors
+```{r}
+data5<-data5 %>% arrange(idno,Age_wk)
+data5<-data5[!duplicated(data5[c('idno','Age_wk')]),]
+aaa<-aggregate(data5$Age_wk,list(data5$idno),rank)
+data5$wave<-as.integer(unlist(aaa$x))
+#rownames(data4)<-NULL
+data5<-data5 %>%  select(idno,wave,!c(idno,wave))%>%
+                  arrange(idno,date.Advia) %>% 
+                  mutate(wave=as.factor(as.character(wave))) %>% 
+                  mutate(cohort=as.factor(as.character(cohort))) %>% 
+                  mutate(sex=as.factor(as.character(sex))) %>% 
+                  mutate(strain=as.factor(as.character(strain))) %>% 
+                  mutate(status=as.factor(as.character(status))) %>% 
+                  mutate(natural_death=as.factor(as.character(natural_death))) %>% 
+                  mutate(dif_weeks=round(dif_weeks,digit=2))
+#str(data5)
+rm(aaa)
+```
+
+NAs before remove outliers
+```{r}
+apply(apply(data4[c(All_Features,Clumps)],2,is.na),2,sum)
+```
+
+NAs after removing outliers: 
+```{r}
+apply(apply(data5[c(All_Features,Clumps)],2,is.na),2,sum)
+
+```
+
+Lamp read error in the flow cytometer:
+Strategy:
+To address the issue and extract clean reads, drop those samples with NA in multiple variables. Samples with NAs in 1/3 of variables (11 or more) are removed (data6)
+```{r}
+n<-11
+data5[rowSums(is.na(data5[All_Features]))>=n,]
+```
+
+```{r}
+data6<-data5[rowSums(is.na(data5[All_Features]))<n,]
+```
+***
+
+### SPLIT SLAM (TRAIN 72 - VALIDATE1 10 - VALIDATE2 18)   
+
+
+#### Split. 
+Strategy: Keep one randomly selected cohort out for final validation
+in a small group.
+Then split the remaining data 4:1 to validate the model in a larger group.   
+
+Store data in 3 Dataframes.
+-train: Dataset corresponding to 3/4 after selection a random cohort.
+-vald: Dataset corresponding to 1 cohort from each study. 
+-validate2: Dataset corresponding to pool of cohorts 1/4 after selection a random cohort.
+
+
+
+Keep all samples from the same mouse together in the same dataset, to avoid information leakage.
+Stratify the splitting (by cohort, strain and sex) to have balanced representation between the training and validating dataset
+```{r}
+data6[,"idno"]<-as.factor(data6[,"idno"])#groupdata requires a factor
+
+set.seed(365)
+validate<-sample(1:10,1) # cohort 7
+validate<-data6 %>% filter(cohort==7)
+data7<-data6 %>% filter(cohort!=7)
+
+#Keep same idno (in training or validating, not both). Balance in Sex cohort and strain
+parts <- groupdata2::partition(data7, p = 0.2, id_col ="idno", cat_col = c("sex","cohort","strain"))
+train<-as.data.frame(parts[[2]])
+validate2<-as.data.frame(parts[[1]])
+```
+
+Check there are no IDs from same animal in the training and validating data sets
+```{r}
+intersect(train$idno,validate2$idno)
+```
+
+Check group balance (cohort, sex and strain frequencies)
+Train
+```{r}
+table(train$cohort,train$sex,train$strain)
+```
+
+
+
+Validation (except random cohort previosly excluded)
+```{r}
+table(validate2$cohort,validate2$sex,validate2$strain)
+```
+
+Idno is stored in olID-variable and a suffix "C" is added to idno to distinguish 
+SLAM-idno from Jackson-Lab's in later dataset merging process.
+
+```{r}
+train_NA <-train %>% 
+  mutate(olID = paste0("C",as.character(idno))) 
+
+validate_NA <-validate %>% 
+  mutate(olID = paste0("C",as.character(idno)))                       
+validate2_NA <-validate2 %>% 
+  mutate(olID = paste0("C",as.character(idno)))
+
+
+
+rm(train,validate2,validate)
+
+```
+
+
+### IMPUTE MISSINGNESS (SEPARATED) 
+#### Three methods:
+Mean value by time point, sex, and strain. 
+Spline by individual
+Random Forest
+
+
+```{r}
+#Function to check NAs
+nas<-function(df){apply(apply(df,2,is.na),2,sum)}
+```
+
+
+```{r Remove NAs,echo=FALSE }
+#| echo: false
+#| warning: false
+
+#Method impute mean by sex strain and timepoint.
+if(params$impute_missingness=="Mean"){
+fillna <- function(x) {ifelse(is.na(x), mean(x,na.rm=TRUE),x)}
+
+train<-train_NA %>% 
+    group_by(sex,strain,Age_wk) %>%
+          mutate_each(funs(fillna), all_of(c(All_Features,Clumps)))
+validate<-validate_NA %>% 
+    group_by(sex,strain,Age_wk) %>%
+          mutate_each(funs(fillna), all_of(c(All_Features,Clumps)))
+validate2<-validate2_NA %>% 
+    group_by(sex,strain,Age_wk) %>%
+          mutate_each(funs(fillna), all_of(c(All_Features,Clumps)))
+
+
+
+}
+
+#method to impute using the spline by ID
+if(params$impute_missingness=="Spline"){
+fillna <- function(x) {ifelse(is.na(x),  na.spline(x,maxgap=3, na.rm = FALSE),x)}
+
+train<-train_NA %>% 
+    group_by(idno) %>%
+          mutate_each(funs(fillna), all_of(c(All_Features,Clumps)))
+
+validate<-validate_NA %>% 
+    group_by(idno) %>%
+          mutate_each(funs(fillna), all_of(c(All_Features,Clumps)))
+
+validate2<-validate2_NA %>% 
+    group_by(idno) %>%
+          mutate_each(funs(fillna), all_of(c(All_Features,Clumps)))
+
+
+
+}
+
+#Method to imput ussing Random Forest
+if(params$impute_missingness=="MissForest"){
+fillna <- function(df, ...){
+
+  dm_prep <- df %>%
+    select(-c(...)) %>%
+    data.matrix()
+  
+  set.seed(365)
+  
+  imp <- missForest(dm_prep, ntree = 500)
+  
+  df_imp <- imp$ximp %>%
+    as.data.frame() 
+  
+  df_final <- df_imp 
+  
+  return(df_final)
+  }
+
+train <- fillna(train_NA, ... = idno,wave,Glucose_ui,       bw_ui,abs_clumps,dob,Died,date.Advia,tod,lifespan,     
+cod,natural_death,date.bw,dif_weeks,olID,dob,date.bw,date.glu) 
+validate<-cbind(validate,validate_NA[,c("idno","wave","Glucose_ui",       "bw_ui","abs_clumps","dob","Died","date.Advia","tod","lifespan",     "cod","natural_death","date.bw","dif_weeks","olID","dob","date.bw","date.glu")])
+
+validate2 <- fillna(validate2_NA, ... = idno,wave,Glucose_ui,       bw_ui,abs_clumps,dob,Died,date.Advia,tod,lifespan,     
+cod,natural_death,date.bw,dif_weeks,olID,dob,date.bw,date.glu) 
+validate<-cbind(validate,validate_NA[,c("idno","wave","Glucose_ui",       "bw_ui","abs_clumps","dob","Died","date.Advia","tod","lifespan",     "cod","natural_death","date.bw","dif_weeks","olID","dob","date.bw","date.glu")])
+
+validate <- fillna(validate_NA, ... = idno,wave,Glucose_ui,       bw_ui,abs_clumps,dob,Died,date.Advia,tod,lifespan,     
+cod,natural_death,date.bw,dif_weeks,olID,dob,date.bw,date.glu) 
+validate<-cbind(validate,validate_NA[,c("idno","wave","Glucose_ui",       "bw_ui","abs_clumps","dob","Died","date.Advia","tod","lifespan",     "cod","natural_death","date.bw","dif_weeks","olID","dob","date.bw","date.glu")])
+}
+```
+
+
+```{r}
+nas(train[,c(All_Features,Clumps)])
+```
+```{r}
+nas(validate2[,c(All_Features,Clumps)])
+```
+
+```{r}
+nas(validate[,c(All_Features,Clumps)])
+```
+
+
+Solve unresolved cases imputing mean value (impute per sex, strain and cohort)
+Applicable only if using Spline method. 
+```{r}
+#| echo: false
+#| warning: false
+to_mean <- function(x) ifelse(is.na(x), mean(x, na.rm=TRUE), x)
+train <-  train %>% 
+  group_by(sex,strain,cohort) %>% 
+   mutate_each(funs(to_mean), all_of(c(All_Features,Clumps)) )
+
+validate2 <-  validate2 %>% 
+  group_by(sex,strain,cohort) %>% 
+   mutate_each(funs(to_mean), all_of(c(All_Features,Clumps)) )
+
+validate <-  validate %>% 
+  group_by(sex,strain,cohort) %>% 
+   mutate_each(funs(to_mean), all_of(c(All_Features,Clumps)) )
+
+```
+
+***
+
+### HARMONIZATION: Batch effect correction: 
+Strategy: Fit a mixed effect model once the Features has been transformed to determine random effect coefficient corresponding to each cohort 1 to 10. NAs not avoided. ID, strain and cohort are considered random effects. One model per feature as outcome,e.g.:
+RBC ~ sex + (1|cohort)+(1|strain)+(1|olID). Use old ID as a factor.
+Then subtract that random coefficient (per cohort) from values under each variable. Since Age is the outcome to be predicted by the clock, Age is not included in this model (to avoid information leakage).
+Then re-run the same LMM to check whether the model indemnifies random effect corresponding to the cohort variable. 
+
+```{r}
+
+library(lme4)
+Harmonize<-function (dataframe,Variables){
+      i<-1; df<-as.data.frame(get(dataframe))
+      Harmo_list<-list()
+      for (i in 1:length(Variables)) {
+          name_pre<-Variables[i]#name of predictor e.g. rbc
+          predictor<-with(df,get(name_pre))# extract the values of that column e.g., rbc
+          mod_no_Age<-lmer(predictor ~ sex +(1|strain)+(1|cohort)+(1|olID),df)#model
+          randon_intercept<-ranef(mod_no_Age)#extract All random intercept differences.
+          randon_intercept_per_cohort<-randon_intercept$cohort #filter cohort only 
+          randon_intercept_per_cohort <- 
+          rownames_to_column(randon_intercept_per_cohort, "Cohort") 
+          #Subtract that coefficient per cohort and variable from original values.
+          df<-df %>% 
+            mutate(ajust=randon_intercept_per_cohort[match(df$cohort,
+            randon_intercept_per_cohort$Cohort),"(Intercept)"]) %>%  
+                             mutate(xx=round((predictor-ajust),digit=2)) %>% 
+                                 rename(!!paste(name_pre, "Harmonized", sep = ".") := xx)
+          Harmo_list[[i]]<-mod_no_Age
+     }
+     names(Harmo_list)<-Variables
+  data_hr<-paste0(dataframe,"_harmonized",sep="")
+  list_hr<-paste0("list_models_",dataframe,"_harmonized",sep="")
+  df<-df %>% dplyr::select(-ajust)
+  assign(data_hr,df, envir=globalenv())
+  assign(list_hr,Harmo_list, envir=globalenv())
+}
+```
+#### Train
+Harmonize train (separated from validate to avoid information leakage)
+Save percentage of cohort variance from total variance (Summary:Random)
+as per Feature in a vector "Variance_cohort_pct"
+
+```{r}
+Feature_HZ<-c(Blood,Metabol,Clumps)
+```
+
+#### Check Batch effect
+```{r}
+train<-train %>% mutate(olID=as.factor(olID))
+Harmonize(dataframe="train",Variables = c(Feature_HZ))
+
+BB<-lapply(list_models_train_harmonized,summary)
+CC<-lapply(BB,function(x) as.data.frame(x$varcor)[,c(1,5)])
+Pct_variance_cohort<-t(as.data.frame(lapply(CC,function(x) 100*(x[2,2]/sum(x[,2])))))
+colnames(Pct_variance_cohort)<-"Variance_cohort_pct"
+rm(BB,CC,AA)
+
+as.data.frame(Pct_variance_cohort) %>% arrange(desc(Variance_cohort_pct))%>% round(digit=4)
+
+ICCTrain<-as.data.frame(Pct_variance_cohort) %>% arrange(desc(Variance_cohort_pct))%>% round(digit=4)
+```
+
+Save the ICC matrix previous to harmonize
+```{r, eval=FALSE}
+ICCTrain
+pa<-paste(patho,"Tables/Output/ICCTrain.csv",sep="")
+write.csv(ICCTrain,pa)
+rm(pa)
+```
+***
+##### Check Batch effect removal Train
+```{r}
+Featur_ht<-paste0(c(Feature_HZ),".Harmonized",sep="")
+Harmonize(dataframe="train_harmonized",Variables = Featur_ht)
+
+BB<-lapply(list_models_train_harmonized_harmonized,summary)
+CC<-lapply(BB,function(x) as.data.frame(x$varcor)[,c(1,5)])
+Pct_variance_cohort_harmonized<-t(as.data.frame(lapply(CC,function(x) 100*(x[2,2]/sum(x[,2])))))
+colnames(Pct_variance_cohort_harmonized)<-"Variance_cohort_pct"
+rm(BB,CC,AA)
+
+as.data.frame(Pct_variance_cohort_harmonized) %>% arrange(desc(Variance_cohort_pct)) %>% round(digit=4)
+
+ICCTrain_hz<-as.data.frame(Pct_variance_cohort_harmonized) %>% arrange(desc(Variance_cohort_pct)) %>% round(digit=4)
+```
+
+Save the ICC matrix after harmonization
+```{r, eval=FALSE}
+ICCTrain_hz
+pa<-paste(patho,"Tables/Output/ICCTrain_hz.csv",sep="")
+write.csv(ICCTrain_hz,pa)
+rm(pa)
+```
+
+
+#### validate2
+#### Check batch effect 
+```{r}
+validate2<-validate2 %>% mutate(olID=as.factor(olID))
+Harmonize("validate2", c(Feature_HZ))
+BB<-lapply(list_models_validate2_harmonized,summary)
+CC<-lapply(BB,function(x) as.data.frame(x$varcor)[,c(1,5)])
+Pct_variance_cohort<-t(as.data.frame(lapply(CC,function(x) 100*(x[2,2]/sum(x[,2])))))
+colnames(Pct_variance_cohort)<-"Variance_cohort_pct"
+rm(BB,CC,AA)
+
+as.data.frame(Pct_variance_cohort) %>% arrange(desc(Variance_cohort_pct))%>% round(digit=4)
+
+```
+
+##### Check Batch effect removal. validate2
+```{r}
+
+Featur_ht<-paste0(c(All_Features,Clumps),".Harmonized",sep="")
+Harmonize(dataframe="validate2_harmonized",Variables = Featur_ht)
+
+BB<-lapply(list_models_validate2_harmonized_harmonized,summary)
+CC<-lapply(BB,function(x) as.data.frame(x$varcor)[,c(1,4)])
+Pct_variance_cohort_harmonized<-t(as.data.frame(lapply(CC,function(x) 100*(x[2,2]/sum(x[,2])))))
+colnames(Pct_variance_cohort_harmonized)<-"Variance_cohort_pct"
+rm(BB,CC,AA)
+
+as.data.frame(Pct_variance_cohort_harmonized) %>% arrange(desc(Variance_cohort_pct)) %>% round(digit=4)
+
+```
+
+***
+### CLUMPS Adjust 
+#### Eosinophils and platelets by clumps:
+Similar strategy applied to cohort-effect harmonization. Clump-formation is considered as a random-effect. A linear mixed effect model is fitted and the random coefficients determined by the model are subtracted from platelets and eosinophils values. Age is kept out of the model to avoid information leakage.
+
+
+```{r}
+library(ggplot2)
+data<-train_harmonized
+p<-ggplot(aes(y=abs_eos.Harmonized, x= abs_clumps.Harmonized, group=olID),data=data[data$abs_clumps.Harmonized >=2.5 & data$abs_clumps.Harmonized <6, ])
+
+p+geom_line() + stat_smooth(aes(group = 1))
+
+```
+
+```{r}
+data<-train_harmonized
+p<-ggplot(aes(y=PLT.Harmonized, x= abs_clumps.Harmonized, group=olID),data=data[data$abs_clumps.Harmonized >=2.5 & data$abs_clumps.Harmonized <6, ])
+
+p+geom_line() + stat_smooth(aes(group = 1))
+
+```
+
+```{r}
+#Fit a LMM with clumps formation as a random effect. Calculates intercept per level of clumps and correct the levels of platelets...by that estimate
+
+Adjust_clumps<-function (dataframe,Variables,adjustVble){
+      i<-1; df<-get(dataframe)
+      for (i in 1:length(Variables)) {
+          name_pre<-Variables[i]
+          predictor<-with(df,get(name_pre))
+          formu<-as.formula(paste0("predictor ~ sex + (1|",adjustVble,") + (1|strain) + (1|olID)"))
+          mod_no_Age<- lmer(formu,df)
+          ran_coef<-ranef(mod_no_Age)#extract random coefficient per level of clumps.
+          coef_clumps<-ran_coef[[adjustVble]] 
+          coef_clumps<-rownames_to_column(coef_clumps, adjustVble) 
+          in_data_frame<-as.vector(round(df[,adjustVble],6))
+          in_model<-round(as.numeric(coef_clumps[,adjustVble]),6)
+          #Subtract coefficient from variable matching level of clumps
+          df$adjust<-coef_clumps[match(in_data_frame, in_model),"(Intercept)"] 
+          df$xx<-round((df[,name_pre]-df[,"adjust"]),digit=2)
+          #rename variable
+          df<-df %>% rename(!!paste(name_pre, "adj_clumps", sep = ".") := xx)
+          }
+  data_hr<-paste0(dataframe,"_adj_clumps",sep="")
+  df<-df %>% dplyr::select(-adjust)
+  assign(data_hr,df, envir=globalenv())
+}
+```
+
+##### Adjust  Eosin and Plt (train)
+```{r}
+eos_plat<-c("abs_eos.Harmonized","pct_EOS.Harmonized","PLT.Harmonized")
+Adjust_clumps(dataframe = "train_harmonized",Variables =eos_plat,"abs_clumps.Harmonized")
+```
+
+##### Adjust  Eosin and Plt (validate2)
+```{r}
+eos_plat<-c("abs_eos.Harmonized","pct_EOS.Harmonized","PLT.Harmonized")
+Adjust_clumps(dataframe = "validate2_harmonized",Variables =eos_plat ,"abs_clumps.Harmonized")
+```
+
+##### Adjust  Eosin and Plt (Validate)
+
+```{r}
+#Version for this dataset including one unique cohort not harmonized. The output of in_data_frame is a list
+Adjust_clumps2<-function (dataframe,Variables,adjustVble){
+      i<-1; df<-get(dataframe)
+      for (i in 1:length(Variables)) {
+          name_pre<-Variables[i]
+          predictor<-with(df,get(name_pre))
+          formu<-as.formula(paste0("predictor ~ sex + (1|",adjustVble,") + (1|strain) + (1|olID)"))
+          mod_no_Age<- lmer(formu,df)
+          ran_coef<-ranef(mod_no_Age)#extract random coefficient per level of clumps.
+          coef_clumps<-ran_coef[[adjustVble]] 
+          coef_clumps<-rownames_to_column(coef_clumps, adjustVble) 
+          in_data_frame<-as.vector(round(df[,adjustVble],6))[[1]] #Pull first element from the list (bug)
+          in_model<-round(as.numeric(coef_clumps[,adjustVble]),6)
+          #Subtract coefficient from variable matching level of clumps
+          df$adjust<-coef_clumps[match(in_data_frame, in_model),"(Intercept)"] 
+          df$xx<-round((df[,name_pre]-df[,"adjust"]),digit=2)
+          #rename variable
+          df<-df %>% rename(!!paste(name_pre, "adj_clumps", sep = ".") := xx)
+          }
+  data_hr<-paste0(dataframe,"_adj_clumps",sep="")
+  df<-df %>% dplyr::select(-adjust)
+  assign(data_hr,df, envir=globalenv())
+}
+```
+
+```{r}
+eos_plat<-c("abs_eos","pct_EOS","PLT")
+Adjust_clumps2(dataframe = "validate",Variables =eos_plat ,"abs_clumps")
+```
+
+
+```{r}
+### XX
+colnames(validate_adj_clumps)[61:63]<-c("abs_eos.adj_clumps",
+"pct_EOS.adj_clumps","PLT.adj_clumps")
+```
+
+
+### FINAL PREPROCESSING
+#### Rename variables to merge with JAX
+Rename variables so they include transformation and save SLAM, train, vald, validate2
+```{r}
+pcte<-Blood[grepl("pct",Blood)]
+rest<-c(setdiff(Blood,pcte),Clumps,Metabol)
+
+SLAM<-data6
+SLAM<-SLAM %>% rename_with(~paste0(.x,"_logit",recycle0 = TRUE), all_of(pcte)) %>% 
+  rename_with(~paste0(.x,"_log",recycle0 = TRUE), all_of(rest))
+
+train_harmonized_adj_clumps<-train_harmonized_adj_clumps %>%rename_with(~paste0(.x,"_logit",recycle0 = TRUE), all_of(pcte)) %>% 
+  rename_with(~paste0(.x,"_log",recycle0 = TRUE), all_of(rest))
+
+
+validate2_harmonized_adj_clumps<-validate2_harmonized_adj_clumps %>% rename_with(~paste0(.x,"_logit",recycle0 = TRUE), all_of(pcte)) %>% 
+  rename_with(~paste0(.x,"_log",recycle0 = TRUE), all_of(rest))
+
+
+validate_adj_clumps<-validate_adj_clumps %>% rename_with(~paste0(.x,"_logit",recycle0 = TRUE), all_of(pcte)) %>% 
+  rename_with(~paste0(.x,"_log",recycle0 = TRUE), all_of(rest))
+
+
+```
+
+
+#### Identify and remove highly correlated variables 
+
+```{r, fig.width=12, fig.height=12}
+#remove high corr from study
+library(corrplot)
+c<-cor(SLAM_RAW[complete.cases(SLAM_RAW[,c(10:43,55,57)]),c(10:43,55,57)])
+#load(paste0(patho,"Tables/SLAM_for_modeling_interpolation.Rdata",sep=""))
+corrplot(c, tl.col = "brown", tl.srt =75, bg = "White",
+         title = "\n \n",
+         type = "full")
+
+```
+```{r}
+symnum(c)
+```
+Remove highly correlated variables from the study pairwise r >= 0.80: 
+Keep those with more clear normal distribution:
+- Keep RBC,           remove measHGB, HCT.
+- Keep WBC,           remove abs_lymph.
+- Keep CHCM,          remove CHCMg, reticCHCM.
+- Keep pct_lymph,     remove pct_neut (neutrophil levels = zero observed).
+- Keep abs_retic,     remove pct_retic. 
+- Keep MCH,           remove CHCMg.
+- Keep pct_monos,     remove abs_monos.
+- Keep abs_neut       remove pct_neuts. 
+- Keep MCV,           remove MCVg.
+- Keep PLT,           remove PCT.
+```{r}
+Features<-c(
+"RBC.Harmonized"                ,"measHGB.Harmonized"            ,"HCT.Harmonized" ,              
+"pct_LUC.Harmonized"            ,"MCV.Harmonized"                ,"MCH.Harmonized" ,              
+"MCHC.Harmonized"               ,"PDW.Harmonized"                ,"CHCM.Harmonized" ,             
+"RDW.Harmonized"                ,"HDW.Harmonized"                ,"PCT.Harmonized"  ,             
+"MPV.Harmonized"                ,"pct_LYM.Harmonized"            ,"pct_EOS.Harmonized.adj_clumps",
+"mature_CHDW.Harmonized"        ,"pct_MONO.Harmonized"           ,"PLT.Harmonized.adj_clumps",          
+"pct_NEUT.Harmonized"           ,"abs_neuts.Harmonized"          ,"abs_lymphs.Harmonized",        
+"abs_monos.Harmonized"          ,"abs_lucs.Harmonized"           ,"abs_eos.Harmonized.adj_clumps",
+"abs_Retic.Harmonized"          ,"pct_Retic.Harmonized"          ,"MCVg.Harmonized" ,             
+"CHCMg.Harmonized"              ,"CHg.Harmonized"                ,"WBC.Harmonized",               
+"reticCHCM.Harmonized"          ,"retic_MCV.Harmonized"          ,"Glucose.Harmonized",           
+"bw.Harmonized"                 ,"abs_clumps.Harmonized")         
+
+Features<-setdiff(Features,c("MCVg.Harmonized",
+                             "measHGB.Harmonized",
+                             "HCT.Harmonized",
+                             "abs_lymphs.Harmonized",
+                             "CHCMg.Harmonized",
+                             "reticCHCM.Harmonized",
+                             "pct_NEUT.Harmonized",
+                             "pct_Retic.Harmonized",
+                             "abs_monos.Harmonized",
+                             "PCT.Harmonized"
+                              ))
+```
+
+### Save datasets
+```{r,eval=FALSE}
+save(train_harmonized_adj_clumps,
+     validate2_harmonized_adj_clumps,
+     validate_adj_clumps,
+     SLAM_RAW,
+     patho,Pheno,Outcms,Features,Blood,
+     file=paste0(patho,"Tables/Transitions/SLAM_for_modeling_72_10_18_.Rdata",sep=""))
+```
+

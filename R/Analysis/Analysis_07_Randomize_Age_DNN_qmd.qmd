@@ -1,0 +1,236 @@
+---
+title: "Hematological Clock 016"
+author: "Jorge Martinez-Romero"
+date: "2023-07-24"
+output: html_document
+---
+  
+### -------------------------------------------------------------------------
+### RESAMPLE 50 (NULL HYPOTHESIS TESTING)
+### -------------------------------------------------------------------------
+
+GOAL: Check that the prediction results are not achieved by chance
+STRATEGY: Generate a null distribution. Build 50 different models shuffling the outcome "Age" and keeping predictors unaltered. Low correlations and high MAE should be expected.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"W:/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+
+```
+
+
+### Load packages
+```{r libraries, echo=FALSE, include=FALSE}
+library("dplyr")
+library("h2o")
+library("Metrics")
+library("groupdata2")
+library("ggplot2")
+```
+
+
+### Retrieve data split and preprocessed
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+rm(pa)
+```
+
+
+```{r}
+library(dplyr)
+library(groupdata2)
+require(h2o)
+library(Metrics)
+localH2o <- h2o.init(nthreads = 6, max_mem_size = "12G")
+```
+
+### Add longitudinal information
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  library(data.table)
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+### Load the funtion for DNN loop. 
+Train the DNNs only in the training set shuffling Age variable. 
+Extract validations and store results and fold indices in data frames.
+Build a models list and save the models in.
+Store models in a folder as "Model Object Optimized" mojo.
+
+```{r}
+Neural_Randomized<-function(tr,ts,ts2,CV,re,delta,eti,pdtors,Outcome,Pheno){
+  #Factor for groupdata2 split. The package requires the ID to be a factor 
+  tr[,"ID"]<-as.factor(tr[,"ID"])
+  if(delta==1){tr<-Add_delta_variable(tr,Features,id="ID")
+  ts<-Add_delta_variable(ts,Features,id="ID")
+  ts2<-Add_delta_variable(ts2,Features,id="ID")
+  num<-"_YesDelta"
+  tr[is.na(tr)]=0#Baseline to 0 in increments = NA
+  ts[is.na(ts)]=0
+  ts2[is.na(ts2)]=0
+  Predictors<-c(Features,colnames(tr)[grepl("Delta.",colnames(tr))])
+  }else{Predictors<-Features
+  num<-"_NoDeltas"}# Include Delta Yes or Not in the name of the model
+  dff<-data.frame(Model=rep(NA,re),R=rep(NA,re),CI1=rep(NA,re),CI2=rep(NA,re),Pval=rep(NA,re),
+                  RMSE=rep(NA,re),
+                  MAE=rep(NA,re),Rv2=rep(NA,re),CI1v2=rep(NA,re),CI2v2=rep(NA,re),Pvalv2=rep(NA,re),
+                  RMSEv2=rep(NA,re),
+                  MAEv2=rep(NA,re))
+  #Container to store the indices of the folds
+  folds_df<-as.data.frame(matrix(rep(NA,nrow(tr)*re),ncol = re))
+  colnames(folds_df)<-gsub("V","Repe_",colnames(folds_df)) 
+  #Container to store the results of the validations
+  Accele_val_df<-as.data.frame(matrix(rep(NA,nrow(ts)*re),ncol = re))
+  colnames(Accele_val_df)<-gsub("V","Acc_",colnames(Accele_val_df)) 
+  
+  Accele_val2_df<-as.data.frame(matrix(rep(NA,nrow(ts2)*re),ncol = re))
+  colnames(Accele_val2_df)<-gsub("V","Acc_",colnames(Accele_val2_df)) 
+  
+  tr$ID<-as.factor(as.character(tr$ID))
+  #Select predictors and store in ColN
+  colN<-c(Predictors,Pheno,Outcome,".folds")
+    tr<-tr %>% arrange(ID,wave) %>% as.data.frame()
+    ts<-ts %>% arrange(ID,wave) %>% as.data.frame()
+    ts2<-ts2 %>% arrange(ID,wave) %>% as.data.frame()
+
+  #Add ID, age to the container
+  Accele_val_df<-cbind(ts$ID,ts$age_wk,Accele_val_df)
+  Accele_val2_df<-cbind(ts2$ID,ts2$age_wk,Accele_val2_df)
+  # Store the models
+  big_list<-list() 
+  #Upload to H20 validation datasets
+  Validate <- as.h2o(ts[,setdiff(colN,".folds")])
+  Validate2 <- as.h2o(ts2[,setdiff(colN,".folds")])
+  y <- "age_wk"
+  # Run the loop to build the 50 DNNS each with one split
+  for (j in 1:re){
+    tr_fk<-tr %>% arrange(ID,wave) %>% as.data.frame()
+    tr_fk$age_wk<-sample(tr$age_wk)#Randomized age
+    folds <- groupdata2::fold(tr_fk, k = CV, id_col ="ID",
+                              cat_col = c('strain','cohort','sex'))
+    folds_df[,j]<-as.vector(folds$.folds)
+    #load to H2O the new structure of folds in the training dataset to perform 10FCV
+    trainh2o2 <- as.h2o(folds[,colN])
+    x <- setdiff(setdiff(colnames(trainh2o2),y),".folds") 
+    rm(folds)
+    #label the model
+    model_id<-paste0(eti,num,"_Rep",j,"_N",format(Sys.time(), "%s"),collapse = "_")
+    model_folder<-paste0(patho,"Models/DDNs50_Random_Age/Models_",eti,num,collapse = "_")
+    #Train-test the model
+    dl_model <- h2o.deeplearning(x = x,
+                                 y = y,
+                                 model_id = model_id,
+                                 training_frame = trainh2o2,
+                                 fold_column=".folds",  
+                                 shuffle_training_data = TRUE,
+                                 activation = "RectifierWithDropout",
+                                 score_each_iteration = TRUE,
+                                 epochs = 1000,
+                                 stopping_metric = "AUTO",
+                                 stopping_tolerance = 1e-02,
+                                 l1=1.0E-4,
+                                 l2=1.0E-5,
+                                 stopping_rounds = 3,
+                                 variable_importances = TRUE)
+ 
+  # Store the model "Model Object Optimized" in a directory for later retrieval if required
+    if(!file.exists(model_folder)){dir.create(model_folder)}
+    mojo_destination <- h2o.save_mojo(dl_model, path = model_folder)
+    big_list[[j]] <- dl_model
+    names(big_list)[[j]] <- model_id
+    print(j)
+    
+    #Store results in dff
+    dff[j,"Model"]<-model_id
+    
+    #Validation 1
+    Hematology_Based_Age_validate<-h2o.predict(object = dl_model, newdata =Validate)
+    Hematology_Based_Age_validate<-as.vector(Hematology_Based_Age_validate)
+    Accele_val_df[,j+2]<-round(Hematology_Based_Age_validate-ts$age_wk,digits=2)
+    r_validate<-cor.test(Hematology_Based_Age_validate,ts$age_wk)
+    dff[j,"R"]<-round(r_validate$estimate,digit=2)
+    dff[j,"CI1"]<-round(r_validate$conf.int[[1]],digit=2)
+    dff[j,"CI2"]<-round(r_validate$conf.int[[2]],digit=2)
+    dff[j,"Pval"]<-round(r_validate$p.value,digit=2)
+    dff[j,"RMSE"]<-round(rmse(ts$age_wk,Hematology_Based_Age_validate),digit=2)
+    dff[j,"MAE"]<-round(mae(ts$age_wk,Hematology_Based_Age_validate),digit=2)
+    
+    #Validation 2
+    Hematology_Based_Age_validate2<-h2o.predict(object = dl_model, newdata =Validate2)
+    Hematology_Based_Age_validate2<-as.vector(Hematology_Based_Age_validate2)
+    Accele_val2_df[,j+2]<-round(Hematology_Based_Age_validate2-ts2$age_wk,digits=2)
+    r_validate2<-cor.test(Hematology_Based_Age_validate2,ts2$age_wk)
+    
+    dff[j,"Rv2"]<-round(r_validate2$estimate,digit=2)
+    dff[j,"CI1v2"]<-round(r_validate2$conf.int[[1]],digit=2)
+    dff[j,"CI2v2"]<-round(r_validate2$conf.int[[2]],digit=2)
+    dff[j,"Pvalv2"]<-round(r_validate2$p.value,digit=2)
+    dff[j,"RMSEv2"]<-round(rmse(ts2$age_wk,Hematology_Based_Age_validate2),digit=2)
+    dff[j,"MAEv2"]<-round(mae(ts2$age_wk,Hematology_Based_Age_validate2),digit=2)
+
+  }
+  #Store the list of models and the results in data frames
+  assign(paste0("List_",model_id,sep=""),big_list, envir = globalenv())
+  assign(paste0("Results_",model_id,sep=""),dff, envir = globalenv())
+  assign(paste0("Folds_10CV_",model_id,sep=""),folds_df, envir = globalenv())
+  assign(paste0("df_accel_val1_",model_id,sep=""),Accele_val_df, envir = globalenv())
+  assign(paste0("df-accel_val2_",model_id,sep=""),Accele_val2_df, envir = globalenv())
+}
+```
+
+#### Run the function using 50 samplings with reposition and differt 10FCV structute.
+```{r, eval = TRUE}
+CVV<-10 # number of folds in cross validation
+ree<-50 # number of random repeats (split 10 subsets keeping id separated and balanced across groups
+cat("Fold Cross Validation: ",CVV," Folds")
+cat("Resamplings: ",ree)
+
+Features<-c("rbc","mcv","mch","mchc","chcm","hdw",    
+            "wbc","plt",
+            "glucose","bw")
+```
+
+
+```{r, eval = FALSE}
+#train
+tra<-train %>% mutate(sex=as.factor(sex))#train
+tst<-vald %>% mutate(sex=as.factor(sex))#Validation pool Cohort C07G08
+tst2<-rbind(validate2,vald) %>% mutate(sex=as.factor(sex))#Validation pool of cohorts
+Neural_Randomized(tr=tra,ts=tst,ts2=tst2,CV=CVV,re=ree,
+       delta=1,
+       eti="50_samp_rdom_age_",
+       pdtors=Features,
+       Outcome="age_wk",Pheno=c("sex","strain"))
+```
+
+####Save
+```{r, eval = FALSE}
+ss<-paste0(patho,"Tables/Output/50_Random_age_DNN_72_10_18_Held_out",format(Sys.time(), "%s"),".RData")
+save.image(ss)
+ss2<-paste0(patho,"Tables/Output/50_Random_age_DNN_72_10_18_Held_out.csv",sep="")
+write.csv(x=Results_50_samp_rdom_age__YesDelta_Rep50_N1697726830,file=ss2)
+sessionInfo()
+```
+
+```{r, eval=TRUE}
+#Manually cache
+load(paste0(patho,"Tables/Output/50_Random_age_DNN_72_10_18_Held_out1697726879.RData",sep=""))
+
+```
+## Results
+```{r}
+Results_50_samp_rdom_age__YesDelta_Rep50_N1697726830
+```
+
+
+
+
