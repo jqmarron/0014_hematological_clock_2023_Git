@@ -10,13 +10,13 @@ output: html_document
 ### -------------------------------------------------------------------------
 
 GOAL: Determine importance assigned by the DNN to each feature
-STRATEGY: Use the DNN 10FCV process including to determine feature importance as per Gedeon's  approach explained in DATA MINING OF INPUTS: ANALYSING MAGNITUDE AND FUNCTIONAL MEASURES Gedeon 1 DOI: 10.1142/s0129065797000227
--Use the entire dataset( This process is independent of the clock construction)
--Perform 10FCV using stratified samples for stratified importance.
+STRATEGY: Use a DNN cross validation process to determine feature importance as per Gedeon's  approach explained in DATA MINING OF INPUTS: ANALYSING MAGNITUDE AND FUNCTIONAL MEASURES Gedeon 1 DOI: 10.1142/s0129065797000227
+-Use the entire dataset (This process is independent of the clock construction)
+-Perform 10FCV using stratified samples for stratified importance by sex, strain, and age range.
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-patho<-"W:/0016_Hematological_clock_2023_Git/"
+patho<-"W:/0014_Hematological_clock_2023_Git/"
 knitr::opts_chunk$set(echo=FALSE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
 options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
 
