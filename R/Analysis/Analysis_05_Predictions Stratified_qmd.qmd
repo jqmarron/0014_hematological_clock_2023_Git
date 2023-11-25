@@ -26,7 +26,7 @@ options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
 GOAL: Validation and clock's predictions by strata 
 
 ## Parameters
-### Parameters explanation.
+### Parameter explanation.
 - sex: "F".  Select sex: "F", "M", "All".
 - strain: "All".  Select strain: "B6", "HET3", "DO", "All".
 
