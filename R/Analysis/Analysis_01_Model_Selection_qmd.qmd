@@ -27,7 +27,7 @@ Strategy:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-patho<-"W:/0016_Hematological_Clock_2023_Git/"
+patho<-"W:/0014_Hematological_Clock_2023_Git/"
 knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
 options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
 
