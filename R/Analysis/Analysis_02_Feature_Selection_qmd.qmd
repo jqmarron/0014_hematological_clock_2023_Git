@@ -10,14 +10,14 @@ self-contained: true
 
 ## FEATURE SELECTION
 
-Goal: Find minimum adequate model 
+Goal: Find the minimum adequate neural netwrok.
 Strategy: To determine the minimal adequate model, use the DNN cross validation process to determine feature importance using Gedeon et al. approach explained in DATA MINING OF INPUTS: ANALYSING MAGNITUDE AND FUNCTIONAL MEASURES.
 T D Gedeon 1 DOI: 10.1142/s0129065797000227.
-Compare DNN predictive performance removing one feature at a time starting from lower importance to higher importance using the ranking of variables obtained in the initial DNN trained during previous process 'model selection' and including 19 varaibles. Select the model with higher R, lower MAE, and lower number of features in the 10FCV.  
+Compare DNN predictive performance removing one feature at a time as a predictor in the network, starting from lower importance to higher importance as per the ranking of variables obtained in the initial DNN trained during previous process 'model selection' and including all 19 variables overlapping the two studies (JAX and SLAM). Select the model with higher R, lower MAE, and lower number of features in the 10FCV.  
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-patho<-"W:/0016_Hematological_clock_2023_Git/"
+patho<-"W:/0014_Hematological_clock_2023_Git/"
 knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
 options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
 
