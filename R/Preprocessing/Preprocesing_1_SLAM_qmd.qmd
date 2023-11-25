@@ -22,7 +22,7 @@ library("magrittr")
 
 ```{r data loadings, message=FALSE, warning=FALSE}
 
-patho<-"W:/0016_Hematological_clock_2023_Git/"
+patho<-"W:/0014_Hematological_clock_2023_Git/"
 
 knitr::opts_chunk$set(echo=FALSE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
 options(max.print=20000,future.globals.maxSize = 4000 * 1024^5)
