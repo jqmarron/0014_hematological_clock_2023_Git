@@ -13,12 +13,12 @@ self-contained: true
 ---
 
 ## DATA ANALYSIS (CLOCK'S PREDICTIONS STRATIFIED)
-Use Sex and Strain for stratification
+GOAL: Determine and compare predictions by sex and strain.
 
 ```{r setup, include=FALSE}
 Sys.setlocale(category = "LC_ALL", locale = "Greek")
 knitr::opts_chunk$set(echo = TRUE)
-patho<-"W:/0016_Hematological_clock_2023_Git/"
+patho<-"W:/0014_Hematological_clock_2023_Git/"
 knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
 options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
 ```
