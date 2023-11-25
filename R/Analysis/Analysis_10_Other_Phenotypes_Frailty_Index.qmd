@@ -383,7 +383,7 @@ Ages in months in Advia
 sort(unique(Blood$month))
 ```
 
-Build and key ID+age in months to merge FI and blood datasets
+Build a key ID+age in months to merge FI and Advia (blood) datasets
 ```{r}
 Blood$index_Age<-paste0(Blood$ID,"_",as.character(Blood$month)
                                , sep="_")
@@ -391,7 +391,7 @@ Blood$index_Age<-paste0(Blood$ID,"_",as.character(Blood$month)
 FI$index_Age<-paste0(FI$ID,"_",as.character(FI$months_cat), sep="_")
 ```
 
-Merge datasets by ID+Age in dataset BI
+Merge datasets by ID+Age
 ```{r}
 AAA<-FI[match(Blood$index_Age,FI$index_Age),]
 AAA<-AAA %>% select("Operator","FI_BER")
