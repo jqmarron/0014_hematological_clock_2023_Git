@@ -343,7 +343,7 @@ Ages in months in FI
 sort(unique(FI$months))
 ```
 
-Ages in months in Advia
+Ages in months in Advia dataset 
 ```{r}
 sort(unique(Blood$months))
 ```
@@ -528,17 +528,16 @@ The LMM, after batch effect and operator effect correction, detects association 
 #### Second approach: Piecewise regression
 Include a knot at top of curve to compare regression with piece-wise regression
 
-Strategy: Find maximun in the acceleration curve and split the regression into two. Acceleration up to the maximum and the acceleration after the maximum (less number of observations with FI). Two regressions, four estimates
-Find the maximum fitting a lm that minimizes the residual std error (scaled Acceleration)
+Strategy: Find breaking point in the acceleration curve and split the regression into two. Acceleration up to the point and the acceleration after the point. Two regressions, four estimates. Find the point by fitting the lm that minimizes the residual std error (scaled Acceleration)
 
-Possible breaking points
+Possible breaking points: Sort the FI and avoid tails.
 ```{r}
 Break_FI<-round(df$FI_BER,digits=2)
 length(table(Break_FI))
 
 ```
 
-31 points in where to break FI; Lets remove 3 point on each tail
+31 points in where to break FI; Lets remove tails.
 
 ```{r}
 Break<-sort(unique(Break_FI))[2:30]
@@ -687,7 +686,7 @@ anova(mo7,mo8)
 
 Simplification not justified. Keep age in the model
 
-Residualize acceleration
+Residualize acceleration to solve the high correlation detected in the correlation matrix.
 ```{r}
 df$Acceleration_rsz<-residuals(lm(Acceleration~age_wk,df))
 ```
