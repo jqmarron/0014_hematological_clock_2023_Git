@@ -15,7 +15,7 @@ self-contained: true
 
 ## DNN TUNNING HYPER-PARAMETERS
 
-GOAL: Find a reasonable optimal DNN configuration (Train 2000 DNNs)
+GOAL: Find an optimal DNN configuration among 2200 DNNs.
 STRATEGY: Find an efficient architecture by building models with different depth, going from 4 layers to 6 layers. Include different number of neurons going from 2x- to 32x- (Inputs = number of predictors + levels in the model). Include different penalization parameters L1 and L2. Include chronological information as a delta-predictor. Consider both flat or incremental neuron number approaches. Use approx 70 % dataset in a 10F-CV process to train and test the models. 
 Select the final model with minimum MAE and higher correlation coefficient between predicted age and chrono age in the 10FCV performed in the training dataset only.
 
@@ -24,7 +24,7 @@ Select the final model with minimum MAE and higher correlation coefficient betwe
 knitr::opts_chunk$set(echo = TRUE)
 # Biowulf: patho <-"/data/martinezromerj2/0014_Blood_Clock_2023/"
 # Local
-patho<-"W:/0016_Hematological_clock_2023_Git/"
+patho<-"W:/0014_Hematological_clock_2023_Git/"
 knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
 options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
 
