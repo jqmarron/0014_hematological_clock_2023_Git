@@ -25,7 +25,7 @@ Version 2: Incorporates statistical analysis to examine the classification of an
 ```{r setup, include=FALSE}
 Sys.setlocale(category = "LC_ALL", locale = "Greek")
 knitr::opts_chunk$set(echo = TRUE)
-patho<-"/spin1/home/linux/martinezromerj2/0016_Hematological_clock_2023_Git/"
+patho<-"/spin1/home/linux/martinezromerj2/0014_Hematological_clock_2023_Git/"
 knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
 options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
 ```
