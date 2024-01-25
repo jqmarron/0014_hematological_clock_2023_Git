@@ -1,9 +1,9 @@
 # Function to merge two longitudinal variables by date and id.
-# Searchs in one dataset (e.g., Body-Weight dataset) and match 
-# (e.g., id-animal plus BW-date) with another variable in a second dataset (example, id-animal plus bleed-date). 
-# A window in the same time units is required.
-# If no match is found (e.g., BW-date +/- 2 weeks) inserts NA,
-# otherwise insert closest date value.
+# Explore a dataset by searching for matches in a second dataset based on ID and date. 
+# For example, match ID-animal plus BW-date in the Body Weight dataset with ID-animal plus bleed-date in the Blood dataset. 
+# A time window in the same units is required. 
+# If no match is found within a specified range (e.g., id and BW-date +/- 2 weeks), insert NA; 
+# otherwise, insert the value corresponding to closest date.
 merge_Vble <- function(data1,
                           data2,
                           id,
