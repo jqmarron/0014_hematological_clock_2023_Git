@@ -202,3 +202,49 @@ for(i in 1:ncol(combina)){
   else{res5<-res5 %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
 }
 ```
+
+```{r,eval=FALSE}
+RR<-res5 %>% select(2,4,29:666) %>% filter(dataset!="train") %>% as.data.frame()
+colnames(RR)
+```
+
+```{r}
+# Function to calculate MAE and RMSE
+calculate_errors <- function(true_values, predicted_values) {
+  mae_value <- mae(true_values, predicted_values)
+  rmse_value <- rmse(true_values, predicted_values)
+  return(data.frame(MAE = mae_value, RMSE = rmse_value))
+}
+```
+
+```{r}
+# Init Correlation, MAE, and RMSE tests
+cor_results <- cor.test(RR$age_wk, RR$Age_out_rbc)
+mae_rmse_results <- calculate_errors(RR$age_wk, RR$Age_out_rbc)
+results_censor <- data.frame(
+  Variable = "Init",
+  Correlation = "Init",
+  Pval = "Init",
+  mae_rmse_results
+)
+```
+```{r}
+# Calculate metrics with predictions with censored variables
+for (i in 4:640) {
+  cor_results <- cor.test(RR$age_wk, RR[, i])
+  mae_rmse_results <- calculate_errors(RR$age_wk, RR[, i])
+  
+  results_censor <- rbind(
+    results_censor,
+    data.frame(
+      Variable = colnames(RR)[i],
+      Correlation = cor_results$estimate,
+      Pval=cor_results$p.value,
+      mae_rmse_results
+    )
+  )
+}
+results_censor<-results_censor[-1,]
+write.csv(results_censor,paste0(patho,"Prediction_with_censored_variables.csv",sep=""))
+```
+
