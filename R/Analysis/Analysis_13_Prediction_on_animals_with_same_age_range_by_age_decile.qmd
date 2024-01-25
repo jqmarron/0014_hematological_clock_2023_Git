@@ -1,1 +1,175 @@
+---
+title: "Hematological Clock 014" 
+subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
 
+author: "Jorge Martinez-Romero"
+date: "2024-01-5"
+format: html 
+params:
+  sex: "All" # "F", "M", "All". 
+  strain: "All" # "B6", "HET3", "DO", "All"
+  method: "differences" # Calculate age acceleration as the "differences" between predicted age and chronological age or as "residuals" after regresing predicted age on chronological age using a non linear regresssion
+  dataset: "All" #Select the dataset in where to perform analyses: "All","vald","validate2", "All_held_out","train"
+toc: true   
+self-contained: true  
+---
+
+
+## CLOCKS PERFORMANCE BY AGE RANGE: 
+Stratify clock predictions by age decile
+
+***
+```{r setup, include=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"/spin1/home/linux/martinezromerj2/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+## Parameters
+### Explain parameters.
+- sex: "F".  Select sex: "F", "M", "All".
+- strain: "All".  Select strain: "B6", "HET3", "DO", "All".
+- method: "differences".  Calculate age acceleration as:.
+  - "differences" between predicted age and chronological age or as
+  - "residuals" after regressing predicted age on chronological age
+    using a non linear loess.
+- dataset: "All". Select the dataset in where to perform analyses:
+    "All", "Vald" (Cohort C07 G08) "Validate2" (Pool of cohorts), "All_held_out" (Includes all samples held out during the training process [Vald + Validate2]), "train" (Training set only).
+    
+```{r libraries, echo=TRUE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("ggplot2")
+library("tidyverse")
+library("dplyr")
+library("survival") 
+library("Metrics")
+library("h2o")
+library("data.table")
+library("Metrics")
+library("eha")
+library("kableExtra")
+library("quantreg")
+library("exact2x2")
+library("utils")
+library("LaplacesDemon")
+library("lme4")
+library("DT")
+library("splines")
+
+```
+
+###  Retrieve data and predict
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+```
+1)  Function add deltas
+
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+### Select features to add delta (No categoricals)
+
+```{r}
+Features<-c("rbc","mcv","mchc","mch","chcm","hdw"  
+,"wbc","plt","glucose","bw")
+```
+
+------------------------------------------------------------------------
+
+```{r}
+Features
+```
+
+------------------------------------------------------------------------
+
+### Load best DNN after tuning
+
+```{r, echo=TRUE}
+library(h2o)
+h2o.init()
+pat<-paste0(patho,"Models/Models_tunning/DNN_blood_62_N1691016783.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+
+```
+
+### Predict using the best DNN tuned
+
+```{r}
+train$dataset<-"train"
+validate2$dataset<-"validate2"
+vald$dataset<-"vald"
+data_all<-rbind(train,validate2,vald)
+```
+
+
+```{r}
+res<-data_all %>% filter(dataset!="train")
+res$age_month<-round(res$age_wk/1, digits = 0)
+res$Decile <- cut(res$age_month, breaks = quantile(res$age_month, probs = seq(0, 1, 0.1)),
+                   labels = FALSE)
+res$Decile<-ntile(res$age_month,10)
+res$Decile<-as.factor(res$Decile)
+table(res$Decile)
+```
+
+
+```{r}
+res<-Add_delta_variable(res,Features)
+predict_DNN<-function(df){dt<-df
+  Validate <- as.h2o(dt)
+  Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+  Hematology_Based_Age<-as.vector(round(Hematology_Based_Age,digit=0))
+  r_test<-cor.test(Hematology_Based_Age,dt$age_wk)
+   samples <- dim(dt)[1]
+  mice <- length(unique(dt$ID)) 
+  max_age<-round(max(dt$age_wk), digits = 0)
+  R<-round(r_test$estimate,digit=2)
+  P<-round(r_test$p.value,digit=2)
+  MAE<-round(mae(dt$age_wk,Hematology_Based_Age),digit=2)
+  RMSE<-round(rmse(dt$age_wk,Hematology_Based_Age),digit=2)
+  return(data.frame(R, P, MAE=MAE,RMSE=RMSE, Samples=samples, Mice=mice, To_age=max_age))
+}
+results_per_ageGroup<-lapply(split(res,res$Decile),predict_DNN)
+
+Results<-do.call(rbind,results_per_ageGroup)
+```
+
+```{r,eval=FALSE}
+write.csv(Results,paste0(patho,"Results_Cross.csv",sep=""))
+RR<-res5 %>% select(2,4,29:666) %>% filter(dataset!="train") %>% as.data.frame()
+colnames(RR)
+```
+
+```{r}
+# Function to calculate MAE and RMSE
+calculate_errors <- function(true_values, predicted_values) {
+  mae_value <- mae(true_values, predicted_values)
+  rmse_value <- rmse(true_values, predicted_values)
+  return(data.frame(MAE = mae_value, RMSE = rmse_value))
+}
+```
+
+
+```{r}
+# Init Correlation, MAE, and RMSE tests
+cor_results <- cor.test(RR$age_wk, RR$Age_out_rbc)
+mae_rmse_results <- calculate_errors(RR$age_wk, RR$Age_out_rbc)
+results_censor <- data.frame(
+  Variable = "Init",
+  Correlation = "Init",
+  Pval = "Init",
+  mae_rmse_results
+)
+```
