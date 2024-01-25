@@ -15,22 +15,23 @@ self-contained: true
 ---
 
 
-## RELATIONSHIP ACC and OTHER PHENOTYPES: 
-Goal: Determine eventual association between age acceleration and other phenotypes.
-1) Frailty index on those animals with both blood samples and frailty analyses. 
-2) Body Weight (Not appropriate analysis because BW is a feature already used in the DNN to calculate acceleration)
+## RELATIONSHIP ACCELERATION and OTHER PHENOTYPES:
+## Version 2: Incorporates statistical analysis to examine the classification of animals into the Young High Frailty (YHF) group and the Old Low Frailty (OLF) group based on blood age acceleration. 
+
+## FRAILTY INDEX, Body Weight (Not appropiate because it is a feature in the DNN to calculate acceleration)
+### Test eventual association with acceleration 
 
 ***
 ```{r setup, include=FALSE}
 Sys.setlocale(category = "LC_ALL", locale = "Greek")
 knitr::opts_chunk$set(echo = TRUE)
-patho<-"W:/0014_Hematological_Clock_2023/"
+patho<-"/spin1/home/linux/martinezromerj2/0016_Hematological_clock_2023_Git/"
 knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
 options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
 ```
 
 ## Parameters
-### Parameter explanation.
+### Explain parameters.
 - sex: "F".  Select sex: "F", "M", "All".
 - strain: "All".  Select strain: "B6", "HET3", "DO", "All".
 - method: "differences".  Calculate age acceleration as:.
@@ -237,13 +238,13 @@ cohorts<-c("11","12","13","14")#remove not SLAM cohorts
 
 
 ```{r}
-FI$ID<-paste0("C",FI$idno)#filter varaibles of interest
+FI$ID<-paste0("C",FI$idno)#filter variables of interest
 FI<-FI %>% select("ID",
                   "FI","bw","sex","strain","dob","date","cohort","Operator",
                   "age_wk") %>% filter(age_wk>=above & age_wk<bellow)
 ```
 
-
+Plot frailty in the SLAM study
 ```{r}
 FI <- FI[!(FI$cohort %in% cohorts),] %>% filter(bw>0)
 FI$Operator<-as.factor(FI$Operator)
@@ -309,6 +310,8 @@ Check effect removal (INTERCEPTS)
 moBER<-lmer(FI_BER~ sex +strain + (1|ID) + (1|cohort)+(1|Operator), FI)
 summary(moBER)
 ```
+
+
 Check effect removal 2 (SLOPES)
 ```{r}
 mo2<-lmer(FI_BER~ sex + strain + (age_wk|Operator) +(1|ID) + (age_wk|cohort), FI)
@@ -343,7 +346,7 @@ Ages in months in FI
 sort(unique(FI$months))
 ```
 
-Ages in months in Advia dataset 
+Ages in months in Advia
 ```{r}
 sort(unique(Blood$months))
 ```
@@ -383,7 +386,7 @@ Ages in months in Advia
 sort(unique(Blood$month))
 ```
 
-Build a key ID+age in months to merge FI and Advia (blood) datasets
+Build a key ID+age in months to merge FI and blood datasets
 ```{r}
 Blood$index_Age<-paste0(Blood$ID,"_",as.character(Blood$month)
                                , sep="_")
@@ -391,7 +394,7 @@ Blood$index_Age<-paste0(Blood$ID,"_",as.character(Blood$month)
 FI$index_Age<-paste0(FI$ID,"_",as.character(FI$months_cat), sep="_")
 ```
 
-Merge datasets by ID+Age
+Merge datasets by key
 ```{r}
 AAA<-FI[match(Blood$index_Age,FI$index_Age),]
 AAA<-AAA %>% select("Operator","FI_BER")
@@ -491,7 +494,7 @@ Remove non significant highly correlated (r=0.84) age and compare models
 mo2<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+sex+strain+(1|ID), REML = FALSE,df)
 summary(mo2)
 ```
-Compare with and without age:
+Compare with and without age as predictor:
 ```{r}
 anova(mo1,mo2)
 ```
@@ -526,25 +529,26 @@ The LMM, after batch effect and operator effect correction, detects association 
 ***
 
 #### Second approach: Piecewise regression
-Include a knot at top of curve to compare regression with piece-wise regression
+Include a knot at FI to compare regression with piece-wise regression
 
-Strategy: Find breaking point in the acceleration curve and split the regression into two. Acceleration up to the point and the acceleration after the point. Two regressions, four estimates. Find the point by fitting the lm that minimizes the residual std error (scaled Acceleration)
+Strategy: Find the best FI break point (Knot) and split the regression into two.  Two regressions, four estimates.
+Best knot = the one that minimize the fit std error.
 
-Possible breaking points: Sort the FI and avoid tails.
+Possible breaking points
 ```{r}
 Break_FI<-round(df$FI_BER,digits=2)
 length(table(Break_FI))
 
 ```
 
-31 points in where to break FI; Lets remove tails.
+31 points in where to break FI; Avoid spliting in the tails
 
 ```{r}
 Break<-sort(unique(Break_FI))[2:30]
 Break
 ```
 
-Find the model that minimize std error splitin on each break
+Find the model that minimize std error splitting on each break
 ```{r}
 d<-numeric(29)
 df$FI<-
@@ -606,9 +610,58 @@ mo6<-lmerTest::lmer(scale(FI_logit)~scale(Acceleration)+ (1|ID), REML=FALSE, df[
 summary(mo6)
 
 ```
+### Classification of FI through age acceleration  
+Goal: Test if age acceleration determined by blood increases the odds of falling in the young high frailty mice group and decreses the odds of falling in the old low frailty group 
+
+```{r}
+# Categorize Age into terciles
+df$YAO <- cut(df$age_wk, breaks = quantile(df$age_wk, c(0, 1/3, 2/3, 1)), labels = c("Y", "A", "O"), include.lowest = TRUE)
+
+# Categorize Frailty within each tercile
+df$FI_category <- NA
+for (tercile in c("Y", "A", "O")) {
+  subset_df <- df[df$YAO == tercile, ]
+  df$FI_category[df$YAO == tercile] <- cut(subset_df$FI_logit, breaks = quantile(subset_df$FI_logit, c(0, 1/3, 2/3, 1)), labels = c("Low", "Medium", "High"), include.lowest = TRUE)
+}
+```
 
 
-### Body weight
+```{r}
+#Flag YHF and OLF mice
+df$YHF<-ifelse(df$YAO=="Y"&df$FI_category==3,1,0)
+df$OLF<-ifelse(df$YAO=="O"&df$FI_category==1,1,0)
+# Print the result
+print(df)
+```
+
+
+```{r}
+library(lme4)
+modelY<-glmer(YHF~Acceleration+sex+strain+(1|ID),data=df, family = binomial)
+summary(modelY)
+```
+
+
+```{r}
+modelO<-glmer(OLF~Acceleration+sex+strain+(1|ID),data=df, family = binomial)
+summary(modelO)
+
+
+```
+
+transform the log-odds into probabilities
+```{r}
+beta_YHF<-0.256441
+Prob_beta_YHF<-plogis(beta_YHF)
+beta_OLF=-0.29686
+Prob_beta_OLF<-plogis(beta_OLF)
+
+
+```
+
+### Body weight analysis
+Goal: Determining eventual association between acc and BW (This approach is not appropriate because BW is already included as a predictor to determine acc by the DNN)
+
 ```{r}
 if(params$method=="residuals"){
   model_loess <- loess(predicted_age~age_wk,Blood)
@@ -686,7 +739,7 @@ anova(mo7,mo8)
 
 Simplification not justified. Keep age in the model
 
-Residualize acceleration to solve the high correlation detected in the correlation matrix.
+Residualize acceleration
 ```{r}
 df$Acceleration_rsz<-residuals(lm(Acceleration~age_wk,df))
 ```
