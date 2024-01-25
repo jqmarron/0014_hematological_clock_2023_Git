@@ -16,7 +16,7 @@ self-contained: true
 
 
 ## RELATIONSHIP ACCELERATION and OTHER PHENOTYPES:
-## Version 2: Incorporates statistical analysis to examine the classification of animals into the Young High Frailty (YHF) group and the Old Low Frailty (OLF) group based on blood age acceleration. 
+Version 2: Incorporates statistical analysis to examine the classification of animals into the Young High Frailty (YHF) group and the Old Low Frailty (OLF) group based on blood age acceleration. 
 
 ## FRAILTY INDEX, Body Weight (Not appropiate because it is a feature in the DNN to calculate acceleration)
 ### Test eventual association with acceleration 
