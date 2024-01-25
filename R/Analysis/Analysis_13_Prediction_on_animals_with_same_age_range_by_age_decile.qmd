@@ -148,28 +148,4 @@ Results<-do.call(rbind,results_per_ageGroup)
 
 ```{r,eval=FALSE}
 write.csv(Results,paste0(patho,"Results_Cross.csv",sep=""))
-RR<-res5 %>% select(2,4,29:666) %>% filter(dataset!="train") %>% as.data.frame()
-colnames(RR)
-```
-
-```{r}
-# Function to calculate MAE and RMSE
-calculate_errors <- function(true_values, predicted_values) {
-  mae_value <- mae(true_values, predicted_values)
-  rmse_value <- rmse(true_values, predicted_values)
-  return(data.frame(MAE = mae_value, RMSE = rmse_value))
-}
-```
-
-
-```{r}
-# Init Correlation, MAE, and RMSE tests
-cor_results <- cor.test(RR$age_wk, RR$Age_out_rbc)
-mae_rmse_results <- calculate_errors(RR$age_wk, RR$Age_out_rbc)
-results_censor <- data.frame(
-  Variable = "Init",
-  Correlation = "Init",
-  Pval = "Init",
-  mae_rmse_results
-)
 ```
