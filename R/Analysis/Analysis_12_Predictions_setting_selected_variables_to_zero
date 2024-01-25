@@ -1,1 +1,204 @@
+---
+title: "Hematological Clock 014" 
+subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
 
+author: "Jorge Martinez-Romero"
+date: "2024-04-03"
+format: html 
+params:
+  sex: "All" # "F", "M", "All". 
+  strain: "All" # "B6", "HET3", "DO", "All"
+  method: "differences" # Calculate age acceleration as the "differences" between predicted age and chronological age or as "residuals" after regresing predicted age on chronological age using a non linear regresssion
+  dataset: "All" #Select the dataset in where to perform analyses: "All","vald","validate2", "All_held_out","train"
+toc: true   
+self-contained: true  
+---
+
+## CLOCKS PERFORMANCE WHEN SOME VARIABLES ARE MISSING: 
+
+***
+```{r setup, include=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+knitr::opts_chunk$set(echo = TRUE)
+patho<-"/spin1/home/linux/martinezromerj2/0016_Hematological_clock_2023_Git/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+## Parameters
+### Explain parameters.
+- sex: "F".  Select sex: "F", "M", "All".
+- strain: "All".  Select strain: "B6", "HET3", "DO", "All".
+- method: "differences".  Calculate age acceleration as:.
+  - "differences" between predicted age and chronological age or as
+  - "residuals" after regressing predicted age on chronological age
+    using a non linear loess.
+- dataset: "All". Select the dataset in where to perform analyses:
+    "All", "Vald" (Cohort C07 G08) "Validate2" (Pool of cohorts), "All_held_out" (Includes all samples held out during the training process [Vald + Validate2]), "train" (Training set only).
+    
+```{r libraries, echo=TRUE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("ggplot2")
+library("tidyverse")
+library("dplyr")
+library("survival") 
+library("Metrics")
+library("h2o")
+library("data.table")
+library("Metrics")
+library("eha")
+library("kableExtra")
+library("quantreg")
+library("exact2x2")
+library("utils")
+library("LaplacesDemon")
+library("lme4")
+library("DT")
+library("splines")
+
+```
+
+###  Retrieve data and predict
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+```
+1)  Function add deltas
+
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+### Select features to add delta (No categoricals)
+
+```{r}
+Features<-c("rbc","mcv","mchc","mch","chcm","hdw"  
+,"wbc","plt","glucose","bw")
+```
+
+------------------------------------------------------------------------
+
+```{r}
+Features
+```
+
+------------------------------------------------------------------------
+
+### Load best DNN after tuning
+
+```{r, echo=TRUE}
+library(h2o)
+h2o.init()
+pat<-paste0(patho,"Models/Models_tunning/DNN_blood_62_N1691016783.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+
+```
+
+### Predict using the best DNN tuned
+
+```{r}
+train$dataset<-"train"
+validate2$dataset<-"validate2"
+vald$dataset<-"vald"
+data_all<-rbind(train,validate2,vald)
+```
+
+```{r}
+res<-data_all
+```
+
+Set 1 predictor to zero
+```{r}
+for(predictor in Features){
+  dt<-data_all
+  dt[,predictor]<-0
+  dt<-Add_delta_variable(dt,Features)
+  Validate <- as.h2o(dt)
+  Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+  new_column<-paste0("Age_out_",predictor,sep="")
+  res<-res %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))
+}
+
+```
+
+Set combination of 2 predictors to zero
+```{r}
+combina<-combn(Features,2,simplify=TRUE)
+for(i in 1:ncol(combina)){
+    dt<-data_all
+  predictor1<-combina[1,i]
+  predictor2<-combina[2,i]
+  dt[,c(predictor1,predictor2)]<-0
+  dt<-Add_delta_variable(dt,Features)
+  Validate <- as.h2o(dt)
+  Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+  new_column<-paste0("Age_out_",predictor1,"_",predictor2,sep="")
+  if(i==1){
+  res2<-res %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
+  else{res2<-res2 %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
+}
+```
+Set combination of 3 predictors to zero
+```{r}
+combina<-combn(Features,3,simplify=TRUE)
+for(i in 1:ncol(combina)){
+  dt<-data_all
+  predictor1<-combina[1,i]
+  predictor2<-combina[2,i]
+  predictor3<-combina[3,i]
+  dt[,c(predictor1,predictor2,predictor3)]<-0
+  dt<-Add_delta_variable(dt,Features)
+  Validate <- as.h2o(dt)
+  Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+  new_column<-paste0("Age_out_",predictor1,"_",predictor2,"_",predictor3,sep="")
+  if(i==1){
+  res3<-res2 %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
+  else{res3<-res3 %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
+}
+```
+Set combination of 4 predictors to zero
+combina<-combn(Features,4,simplify=TRUE)
+for(i in 1:ncol(combina)){
+  dt<-data_all
+  predictor1<-combina[1,i]
+  predictor2<-combina[2,i]
+  predictor3<-combina[3,i]
+  predictor4<-combina[4,i]
+  dt[,c(predictor1,predictor2,predictor3,predictor4)]<-0
+  dt<-Add_delta_variable(dt,Features)
+  Validate <- as.h2o(dt)
+  Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+  new_column<-paste0("Age_out_",predictor1,"_",predictor2,"_",predictor3,"_",predictor4,"_",sep="")
+  if(i==1){
+  res4<-res3 %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
+  else{res4<-res4 %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
+}
+
+Set combination of 5 predictors to zero
+```{r}
+combina<-combn(Features,5,simplify=TRUE)
+for(i in 1:ncol(combina)){
+  dt<-data_all
+  predictor1<-combina[1,i]
+  predictor2<-combina[2,i]
+  predictor3<-combina[3,i]
+  predictor4<-combina[4,i]
+  predictor5<-combina[5,i]
+  dt[,c(predictor1,predictor2,predictor3,predictor4,predictor5)]<-0
+  dt<-Add_delta_variable(dt,Features)
+  Validate <- as.h2o(dt)
+  Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+  new_column<-paste0("Age_out_",predictor1,"_",predictor2,"_",predictor3,"_",predictor4,"_",predictor5,sep="")
+  if(i==1){
+  res5<-res4 %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
+  else{res5<-res5 %>% mutate(!!new_column:=as.vector(round(Hematology_Based_Age,digit=0)))}
+}
+```
