@@ -649,7 +649,7 @@ summary(modelO)
 
 ```
 
-Transform the log-odds into odds
+Transform the log-odds into probabilities
 ```{r}
 beta_YHF<-0.256441
 Prob_beta_YHF<-plogis(beta_YHF)
