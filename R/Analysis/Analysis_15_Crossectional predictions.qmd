@@ -1,5 +1,5 @@
 ---
-title: "Hematological Clock 014: Crossectional Analysis" 
+title: "Hematological Clock 014: Crossectional Predictions" 
 subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
 
 author: "Jorge Martinez-Romero"
@@ -16,7 +16,7 @@ self-contained: true
 
 
 ## CLOCKS PERFORMANCE BY AGE RANGE: 
-Stratify clock predictions by age decile
+Stratify clock predictions by age month
 
 ***
 ```{r setup, include=FALSE}
@@ -122,7 +122,7 @@ table(res$age_month)
 
 Aggregate low observations to have samples enought to perform MAE, and correlation tests:
 7,8->category 7
-24,25,26->category25
+24,25,26->category 25
 27,29,32->category 29
 ```{r}
 res$category<-ifelse(res$age_month==8,7,res$age_month)
