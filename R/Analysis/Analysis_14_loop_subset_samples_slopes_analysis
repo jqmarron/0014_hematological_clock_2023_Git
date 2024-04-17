@@ -890,7 +890,7 @@ for(x in cutting){
 df<- CC %>%
   group_by(ID) %>%
   filter(n() > 2) %>% filter(final_natural_death==1) #%>% 
-df<-df %>% filter(age_wk<=x) %>% #Keep samples bellolw the threshold x
+df<-df %>% filter(age_wk<=x) #Keep samples bellolw the threshold x
 if(params$keep_animals=="No"){  
      df<-df %>% filter(final_lifespan>=x)} # Remove animals dying before threshold x
 df<- data.table(df)
