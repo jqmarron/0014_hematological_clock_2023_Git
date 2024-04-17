@@ -1,1 +1,128 @@
+---
+title: "Table LMM and Cox acc sub-setting by age"
+author: "Jorge Martinez-Romero"
+date: "2024-04-16"
+format: html 
+params:
+  dataset: "All" #Select the dataset in where to perform analyses: "All","All_held_out".
+  keep_animals: "No" # To keep or remove animals in the subset analyses
+toc: true   
+self-contained: true  
+---
+
+```{r libraries, echo=TRUE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("ggplot2")
+library("tidyverse")
+library("dplyr")
+library("survival") 
+library("Metrics")
+library("h2o")
+library("data.table")
+library("Metrics")
+library("eha")
+library("kableExtra")
+library("quantreg")
+library("exact2x2")
+library("utils")
+library("LaplacesDemon")
+library("lme4")
+
+```
+
+### Loop mortality subsetting samples  (Age)
+Version of the survival analyses 9 including filtering the analyses to include different subset of samples by Age only in the analysis involving acceleration.
+Goal: Determine validity of the models. Sub-setting starting from samples bellow 60 weeks age up to 130 weeks by increments of 10 weeks -samples. Two versions: Keeping animals dying before threshold or not.
+
+Load the dataset from Analysis 9
+```{r}
+if(params$dataset=="All"){
+load("/data/martinezromerj2/0016_Hematological_clock_2023/Tables/Transitions/All_T1vsT3.Rdata")   
+}else{
+load("/data/martinezromerj2/0016_Hematological_clock_2023/Tables/Transitions/held_out_T1vsT3.Rdata")  
+}
+```
+
+
+```{r}
+#| echo: false
+#| warning: false
+
+cutting<-c(seq(60,130, by=10))
+results <- data.frame()
+for (x in cutting){
+AC<-AB %>% filter(age_wk<=x) 
+AC<-AC %>% filter(final_lifespan>=x)
+if(length(unique(AC$strain))==1){
+  formula4<-as.formula("scale(Acceleration) ~ Class + sex+ scale(age_wk) +  (1|cohort) + (scale(age_wk) | ID)")
+}else{formula4<-as.formula("scale(Acceleration) ~ Class + sex+scale(age_wk) + (1|strain) + (1|cohort) + (scale(age_wk) | ID)")}
+
+# extend the dataset fot time dependent Cox
+df_indep<-AC %>% group_by(ID) %>% 
+  summarise(endpt=first(final_natural_death),
+            final_lifespan=first(final_lifespan),
+            cohort=first(cohort),
+            dataset=first(dataset),
+            strain=first(strain),
+            final_natural_death=first(final_natural_death),
+            sex=first(sex)) %>% tidyr::drop_na() %>% filter(final_lifespan!=0)
+df_indep1 <-
+  tmerge(data1=df_indep,
+         data2=df_indep,
+         id=ID,
+         event=event(final_lifespan, endpt))
+
+df_dep<-AC %>% select(ID,sex,strain,
+                      final_lifespan,final_natural_death,Acceleration,age_wk) %>% 
+  mutate(Acceleration=round(Acceleration,digit=2))
+
+df_final <-
+  tmerge(data1=df_indep1,
+         data2=df_dep,
+         id=ID,
+         Acceleration=tdc(age_wk, Acceleration))
+
+AA<-df_final%>% tidyr::drop_na() %>% mutate(age_wk=round(tstart,1),
+                                                  tstart=round(tstart,1),
+                                                  tstop=round(tstop,digits=1))
+#LMM analysis
+mod <- lmerTest::lmer(formula4, AC)
+  p_value <- summary(mod)$coefficients[2,5]
+  intercept <- summary(mod)$coefficients[2,1]
+  beta_T3 <- summary(mod)$coefficients[2,2]
+  AC$sa<-1
+  samples<-aggregate(sa~Class,data=AC,sum)
+  AD<-AC %>% distinct(ID, .keep_all = TRUE)
+  mice<-aggregate(sa~Class,data=AD,sum)
+  
+#Cox  
+Y<-Surv(time = AA$tstart,time2 = AA$tstop,AA$event)
+formula1<-as.formula("Y~Acceleration+strata(age_wk)+strata(cohort)+strata(sex)+strata(strain)")
+
+mod1<-coxph(formula1,id=ID,data = AA)
+CIup<-round(exp(summary(mod1)$coefficients[1,1]+1.96*summary(mod1)$coefficients[1,3]),digits = 4)
+CIdown<-round(exp(summary(mod1)$coefficients[1,1]-1.96*summary(mod1)$coefficients[1,3]),digits = 4)
+HRCox<-paste0(round(summary(mod1)$coefficients[1,2],digits=4),"(",CIdown,"-",
+                   CIup,")")
+pvalCox<-round(summary(mod1)$coefficients[1,5],4)
+temp_df <- data.frame(
+    Dataset = x,
+    P_Value = p_value,
+    All_s=samples[1,2]+samples[2,2],
+    All_m=mice[1,2]+mice[2,2],
+    Samples_T1= samples[1,2],
+    Mice_T1= mice[1,2],
+    Samples_T3= samples[2,2],
+    Mices_T3= mice[2,2],
+    Cox_HR=HRCox,
+    Cox_pval=pvalCox
+  )
+results <- bind_rows(results, temp_df)
+}
+```
+
+```{r}
+results_slope<-results[,1:10]
+write.csv(results_slope,file="/data/martinezromerj2/0016_Hematological_clock_2023/Tables/Output/results2.csv")
+```
 
