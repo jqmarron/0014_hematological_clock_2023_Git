@@ -16,7 +16,7 @@ self-contained: true
 
 
 ## DATA ANALYSIS (SURVIVAL)
-
+Note: The term "acceleration" in the code has been replaced with the more appropriate term "aging gap" in the manuscript.
 
 ```{r setup, include=FALSE}
 Sys.setlocale(category = "LC_ALL", locale = "Greek")
