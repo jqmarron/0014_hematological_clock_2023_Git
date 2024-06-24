@@ -18,6 +18,7 @@ self-contained: true
 ## ACCELERATION COMPARISON BY SEXES AND STRAINS: 
 
 GOAL: Test significant differences on acceleration by strata. 
+Note: The term "acceleration" in the code has been replaced with the more appropriate term "aging gap" in the manuscript.
 
 ***
 ```{r setup, include=FALSE}
