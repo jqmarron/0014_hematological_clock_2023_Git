@@ -1,0 +1,695 @@
+---
+title: "Plots Cox Gompertz analysis 9 window 70, `r params$dataset`" 
+subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
+
+author: "Jorge Martinez-Romero"
+date: "2024-05-23"
+format: html 
+params:
+  terc_at_70: "yes"
+  sex: "All" # "F", "M", "All". 
+  strain: "All" # "B6", "HET3", "DO", "All"
+  method: "differences" # Calculate age acceleration as the "differences" between predicted age and chronological age or as "residuals" after regresing predicted age on chronological age using a non linear regresssion
+  dataset: "vald" #Select the dataset in where to perform analyses: "All","vald","validate2", "All_held_out","train"
+toc: true   
+self-contained: true  
+---
+
+
+## DATA ANALYSIS (SURVIVAL)
+Plots Version of Analysis 9 limiting the samples to the window 0-70 weeks and removing animals dying before 70 weeks.
+Goal: Detect the ability of aging acceleration to predict mortality when animals are young-adult (70 week window) and are still alive.
+Note: The term "acceleration" in the code has been replaced with the more appropriate term "aging gap" in the manuscript.
+
+```{r setup, include=FALSE}
+Sys.setlocale(category = "LC_ALL", locale = "Greek")
+knitr::opts_chunk$set(echo = TRUE)
+patho<-patho<-"/vf/users/martinezromerj2/0016_Hematological_clock_2023/"
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, messages=FALSE, comment = NA, root.dir = patho, fig.pos = 'H')
+options(max.print=2000,future.globals.maxSize = 4000 * 1024^5)
+```
+
+## Parameters
+### Explain parameters.
+- sex: "F".  Select sex: "F", "M", "All".
+- strain: "All".  Select strain: "B6", "HET3", "DO", "All".
+- method: "differences".  Calculate age acceleration as:.
+  - "differences" between predicted age and chronological age or as
+  - "residuals" after regressing predicted age on chronological age
+    using a non linear loess.
+- dataset: "All". Select the dataset in where to perform analyses:
+    "All", "Vald" (Cohort C07 G08) "Validate2" (Pool of cohorts), "All_held_out" (Includes all samples held out during the training process [Vald + Validate2]), "train" (Training set only).
+
+```{r libraries, echo=TRUE, include=FALSE}
+extrafont::loadfonts(device="win")
+library("ggplot2")
+library("tidyverse")
+library("dplyr")
+library("survival") 
+library("Metrics")
+library("h2o")
+library("data.table")
+library("Metrics")
+library("eha")
+library("kableExtra")
+library("quantreg")
+library("exact2x2")
+library("utils")
+library("LaplacesDemon")
+library("lme4")
+
+```
+
+##  Retrieve data and predict
+
+```{r Retrieve Advia}
+load(paste0(patho,"Tables/Transitions/ALL_merged_for_modeling_72_10_18_.Rdata",sep=""))
+patho<-"/vf/users/martinezromerj2/0016_Hematological_clock_2023/"
+Survival_CMS <- read_csv(paste(patho,"Tables/Source/survival_detailed_2023-07-25.csv",sep=""),col_types = cols(cohort = col_factor(levels = c("1",
+"2", "3", "4", "5", "6", "7", "8",
+"9", "10")), sex = col_factor(levels = c("F",
+"M")), strain = col_factor(levels = c("B6",
+"HET3")), tod = col_date(format = "%m/%d/%Y"),
+dob = col_date(format = "%m/%d/%Y"),
+dead_censor_nat = col_factor(levels = c("0",
+"1"))))
+#filter animals cohort 1-10 and natural death
+CMS<-Survival_CMS %>% mutate(ID=as.factor(paste0("C",idno,dif="")),
+                             lifespan=age_wk) %>% 
+                              select("ID","project","cohort","lifespan",
+                                     "cod","sex","strain","dead_censor_nat") %>% 
+                                filter(project=="SLAM"& !is.na(cohort) & dead_censor_nat==1) %>% as.data.frame()
+```
+
+Update survival after final diagnosis by NIA-NIH veterinarians (CMS)
+
+```{r}
+update_mortality<-function(df){
+      #merge the Advia dataset with CMS-> NAs for non natural death
+      df <- df %>%
+      left_join(., CMS, by = "ID") 
+      #Build a natural death censor with same values for JAX 
+      df<-df %>% mutate(
+      final_lifespan= ifelse(strain.x=="DO",lifespan.x,lifespan.y))
+      #Build a lifespan variable with same values for JAX
+      df <- df %>% mutate(
+      final_natural_death=ifelse(strain.x=="DO",natural_death,natural_death))
+      #Update natural death censor and lifespan according to final NIA-CMS veterinarian report
+      df <- df %>% mutate(#Correct lifespan as per NIH-CMS  
+      final_lifespan= ifelse(strain.x!="DO"& is.na(dead_censor_nat),
+                             lifespan.x,final_lifespan))
+      df<-df %>% mutate(# Censor animals not in NIH-CMS natural death
+      final_natural_death=ifelse(is.na(final_natural_death),
+                                 0,final_natural_death))  
+      df<-df %>% select(!c("project.y","dead_censor_nat","cohort.y","lifespan.y","cod","sex.y","strain.y")) %>% filter(final_lifespan!=0)
+      namess<-gsub("\\.x","",colnames(df))
+      colnames(df)<-namess
+      df$strain=as.factor(df$strain)
+      df$sex=as.factor(df$sex)
+      df$cohort=as.factor(df$cohort)
+      df$ID=as.factor(as.character(df$ID))
+#Two records with no CMS identification in Advia. From 12.010 to 12.008       
+      return(df)
+}
+```
+
+
+
+```{r}
+Animals<-rbind(train,vald,validate2)
+Animals %>%
+  group_by(ID, sex,strain) %>%
+  summarise(Animals = n_distinct(ID)) %>%
+  group_by(sex,strain) %>%
+  summarise(Num_Individuals = sum(Animals >= 1))
+```
+
+
+
+```{r}
+train<-update_mortality(train)
+validate2<-update_mortality(validate2)
+vald<-update_mortality(vald)
+
+#aa<-df %>% select(ID,strain,lifespan,final_lifespan,natural_death,final_natural_death) %>% mutate(
+ # dif=lifespan-final_lifespan,dif2= natural_death-final_natural_death)
+```
+
+1)  Function add deltas
+
+```{r}
+Add_delta_variable<-function(df,V1,id){
+  ftr<-data.table(df)
+  V1<-V1
+  V2 <- paste("Delta", V1, sep=".")
+  BB<-ftr[, (V2) := .SD-shift(.SD, type='lag'), by = ID, .SDcols=V1]
+  BB<-as.data.frame(BB)
+  BB[is.na(BB)]<-0
+  return(BB)
+}
+```
+
+### Select features to add delta (No categoricals)
+
+```{r}
+Features<-c("rbc","mcv","mchc","mch","chcm","hdw"  
+,"wbc","plt","glucose","bw")
+```
+
+------------------------------------------------------------------------
+
+```{r}
+Features
+```
+
+------------------------------------------------------------------------
+
+### Load best DNN after tuning
+
+```{r, echo=TRUE}
+library(h2o)
+h2o.init()
+pat<-paste0(patho,"Models/Models_tunning/DNN_blood_62_N1691016783.zip",sep="")
+imported_model <- h2o.import_mojo(pat)
+
+```
+
+### Predict using the best DNN tuned
+
+```{r}
+train$dataset<-"train"
+validate2$dataset<-"validate2"
+vald$dataset<-"vald"
+data_all<-rbind(train,validate2,vald)
+data_all<-Add_delta_variable(data_all,Features,id="ID")
+Validate <- as.h2o(data_all)
+Hematology_Based_Age<-h2o.predict(object = imported_model, newdata =Validate)
+    Hematology_Based_Age<-as.vector(round(Hematology_Based_Age,digit=0))
+data_all$predicted_age<-Hematology_Based_Age 
+```
+
+Select Dataset to run the analysis according to parameter params$dataset
+
+```{r,warning=FALSE}
+
+  if(params$dataset == "All_held_out"){
+    data_all<-data_all[data_all$dataset!="train",]}
+  if(params$dataset == "train"){
+    data_all<-data_all[data_all$dataset=="train",]}
+  if(params$dataset == "vald"){
+    data_all<-data_all[data_all$dataset=="vald",]}
+ if(params$dataset == "validate2"){
+    data_all<-data_all[data_all$dataset=="validate2",]}
+
+```
+
+Select the sex and the strain according to the parameters sex and strain
+
+```{r,warning=FALSE}
+if(params$sex != "All"){
+ data_all<-data_all %>% filter(sex==params$sex)
+ CMS<-CMS %>% filter(sex==params$sex)
+ Sx<-unique(as.character(train$sex))
+cat("Sex = ", Sx)
+}
+```
+
+```{r,warning=FALSE}
+if(params$strain != "All"){
+ data_all<-data_all %>% filter(strain==params$strain)
+ CMS<-CMS %>% filter(strain==params$strain)
+ St<-unique(as.character(train$strain))
+ cat("Strain = ", St)
+ }
+```
+
+```{r}
+if(params$strain == "All"){St<-"All"}
+if(params$sex == "All"){Sx<-"All"}
+if(params$dataset == "All"){Sv<-"All"}
+
+```
+
+### Transform survival dataframe in extended
+
+Transform the data frame into extended START/STOP-format to compute the
+Age_acceleration as a time dependent co-variate with multiples values
+for the same ID across age.
+
+
+
+```{r}
+data_all<-data_all %>% filter(age_wk<=70) %>% filter(final_lifespan>70) 
+```
+
+
+
+```{r}
+#Build the time dependent dataframe with mortality
+data_all$ID<-as.character(data_all$ID)
+df_indep<-data_all %>% group_by(ID) %>% 
+  summarise(endpt=first(final_natural_death),
+            final_lifespan=first(final_lifespan),
+            cohort=first(cohort),
+            dataset=first(dataset),
+            strain=first(strain),
+            final_natural_death=first(final_natural_death),
+            project=first(project),
+            sex=first(sex)) %>% tidyr::drop_na() %>% filter(final_lifespan!=0)
+df_indep1 <-
+  tmerge(data1=df_indep,
+         data2=df_indep,
+         id=ID,
+         event=event(final_lifespan, endpt))
+
+
+df_dep<-data_all %>% select(ID,wave,all_of(Pheno),final_lifespan,final_natural_death,predicted_age,age_wk) %>% 
+  mutate(predicted_age=round(predicted_age,digit=1))#Include tolerance to keep the record
+
+#Consider animals with lifespan equals last blood test = not natural death 
+df_final <-
+  tmerge(data1=df_indep1,
+         data2=df_dep,
+         id=ID,
+         predicted_age=tdc(age_wk, predicted_age))
+
+df_final<-df_final%>% tidyr::drop_na() %>% mutate(age_wk=round(tstart,1),
+                                                  tstart=round(tstart,1),
+                                                  tstop=round(tstop,digits=1))
+
+
+
+```
+
+
+
+
+
+
+Remove non natural death and count animals by frequency
+
+```{r}
+# Filter natural death
+AA<-df_final %>% filter(final_natural_death==1) %>%  
+               mutate(status=as.numeric(as.character(event))) %>% 
+                                                select(-c(endpt,event)) %>% 
+relocate(status,.after = tstop)
+cat("Animals (natural death only): ",length(unique(AA$ID)),"Sex: ",params$sex," Strain:  ",St)
+```
+
+```{r}
+BBB<-as.data.frame(table(AA$ID)) %>% 
+group_by(Freq) %>% summarise(mice=n())
+kable(BBB) %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+```
+
+
+
+```{r}
+CCC<-AA %>% 
+group_by(strain, sex) %>% summarise(count = n_distinct(ID))
+kable(CCC) %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+## Acceleration
+### Include Acceleration in the model as a time dependent risk factor
+
+### Calculate acceleration depending on the method selected
+
+```{r}
+if(params$method=="residuals"){
+  model_loess <- loess(predicted_age~age_wk,AA)
+  AA<-AA%>% tidyr::drop_na() %>% mutate(Acceleration=model_loess$residuals)
+}else{
+  AA<-AA%>% tidyr::drop_na() %>% mutate(Acceleration=predicted_age-age_wk)}
+```
+
+```{r}
+BB<- AA %>% select(-c(5,3)) %>% head(20)
+```
+
+```{r}
+kable(BB) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+```{r}
+#cleanning
+
+rm(df_final,df_indep,df_indep1,df_dep)
+```
+
+
+
+
+
+## Survival 
+### Acceleration (continous variable)
+Acceleration as risk factor (time dependent)
+
+```{r}
+cat("Sex: ",params$sex) 
+cat("Strain: ",params$strain)  
+cat("Method: ",params$method)
+cat("Dataframe: ",params$dataset)
+```
+
+Cox extended model for: 
+
+```{r}
+#Refactorize for modeling stratified
+AA$project<-as.factor(as.character(AA$project))
+AA$cohort<-as.factor(as.character(AA$cohort))
+AA$strain<-as.factor(as.character(AA$strain))
+AA$sex<-as.factor(as.character(AA$sex))
+AA$ID<-as.factor(as.character(AA$ID))
+```
+
+```{r,eval=FALSE}
+#Save the dataset 
+pat<-paste0(patho,"Tables/Output/Mortality_extended.csv",sep="")
+if(params$dataset=="All"){write.csv(AA,file=pat)
+rm(pat)}
+```
+
+
+```{r}
+if (params$sex!="All" & params$strain != "All" ){
+formula1<-as.formula("Y~Acceleration+age_wk")
+formula2<-as.formula("Y~Acceleration+strata(age_wk)+strata(cohort)")
+Y<-Surv(time = AA$tstart,time2 = AA$tstop,AA$status)
+mod1<-phreg(formula1, dist="gompertz",param="rate",data=AA)
+mod2<-coxph(formula2,id=ID,data = AA)
+mod22<-coxph(formula1,id=ID,data = AA)
+}
+```
+
+
+```{r}
+if (params$sex =="All" & params$strain != "All"){
+formula1<-as.formula("Y~Acceleration+age_wk+sex")
+formula2<-as.formula("Y~Acceleration+strata(age_wk)+strata(cohort)+strata(sex)")
+Y<-Surv(time = AA$tstart,time2 = AA$tstop,AA$status)
+mod1<-phreg(formula1, dist="gompertz",param="rate",data=AA)
+mod2<-coxph(formula2,id=ID,data = AA)
+mod22<-coxph(formula1,id=ID,data = AA)
+}
+```
+
+
+```{r}
+if (params$sex !="All" & params$strain == "All" ){
+formula1<-as.formula("Y~Acceleration+age_wk+strain")
+formula2<-as.formula("Y~Acceleration+strata(age_wk)+strata(cohort)+strata(strain)")
+Y<-Surv(time = AA$tstart,time2 = AA$tstop,AA$status)
+mod1<-phreg(formula1, dist="gompertz",param="rate",data=AA)
+mod2<-coxph(formula2,id=ID,data = AA)
+mod22<-coxph(formula1,id=ID,data = AA)
+}
+```
+
+
+```{r}
+if (params$sex !="All" & params$strain != "All"){
+formula1<-as.formula("Y~Acceleration+ age_wk")
+formula2<-as.formula("Y~Acceleration+strata(age_wk)+strata(cohort)")
+Y<-Surv(time = AA$tstart,time2 = AA$tstop,AA$status)
+mod1<-phreg(formula1, dist="gompertz",param="rate",data=AA)
+mod2<-coxph(formula2,id=ID,data = AA)
+mod22<-coxph(formula1,id=ID,data = AA)
+}
+```
+
+
+```{r}
+if (params$sex =="All" & params$strain == "All"){
+formula1<-as.formula("Y~Acceleration+age_wk+sex+strain")
+formula2<-as.formula("Y~Acceleration+strata(age_wk)+strata(cohort)+strata(sex)+strata(strain)")
+Y<-Surv(time = AA$tstart,time2 = AA$tstop,AA$status)
+mod1<-phreg(formula1, dist="gompertz",param="rate",data=AA)
+mod2<-coxph(formula2,id=ID,data = AA)
+mod22<-coxph(formula1,id=ID,data = AA)
+}
+```
+
+#### Cox
+```{r}
+cat("Sex: ",params$sex,". Strain: ",params$strain,". Acceleration = ", params$method,". Dataset = ", params$dataset)
+```
+
+```{r}
+formula2
+```
+
+```{r}
+summary(mod2)
+```
+
+
+#### Gompertz
+
+```{r}
+formula1
+```
+
+```{r}
+if(params$dataset=="vald"){mod1}
+if(params$dataset!="vald"){summary(mod1)}
+```
+
+### Acceleration (categorical)
+Three quantiles (Age acceleration)
+Identify high and low acceleration from the acceleration distribution
+(Tercile tails). Include those labels (T1, T2 and T3) as a
+time-dependent predictor in the models. This quantifies specific time
+per mouse being on each top, mid, or bottom tercile.
+
+Important to notice: One mouse can change within terciles so it can be
+in T1 at time point x and T3 at time point x+1 and viceversa
+
+```{r}
+if(params$strain=="DO"){AA<-AA[AA$ID!="JDO.0014",]}
+if(params$terc_at_70=="yes"){
+  AZ<-AA %>% filter(age_wk<=70)
+  percentiles <- quantile(unique(AZ$Acceleration), probs = c(0.33, 0.66))
+  lower<-as.vector(percentiles[1])
+  upper<-as.vector(percentiles[2])
+AA$Q<-ifelse(AA$Acceleration<=lower,1,
+ifelse(AA$Acceleration>upper,3,2))
+
+AA$Q<-as.factor(paste0("Tercile",AA$Q))
+Terciles<-AA
+  }
+if(params$terc_at_70!="yes"){
+AA$Q<-ntile(AA$Acceleration,3)
+AA$Q<-as.factor(paste0("Tercile",AA$Q))
+Terciles<-AA
+}
+```
+
+Plot # samples before 70 weeks per group 
+```{r}
+ data <- Terciles %>% filter(age_wk<=70 & final_lifespan>=70) %>% 
+   mutate(timepoint=round(age_wk/13.5,0))
+
+```
+
+
+```{r,eval=FALSE}
+# Summarize the count of measures by wave and category
+summary_data <- data %>% filter(Q!="Tercile2") %>% 
+  group_by(timepoint, Q) %>%
+  summarise(count = n(), .groups = 'drop')
+```
+
+
+```{r,eval=FALSE}
+# Plotting with ggplot2
+ggplot(summary_data, aes(x = timepoint, y = count, fill = Q)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Measures by Wave and Acceleration Tercile",
+       x = "Wave (3 months between timepoint)",
+       y = "",
+       fill = "Acceleration") +
+  theme_minimal()+
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
+
+```{r}
+# Summarize the count of measures by wave and category
+summary_data <- data %>% filter(Q!="Tercile2") %>% 
+  group_by(Q) %>%
+  summarise(count = n(), .groups = 'drop')
+
+```
+
+
+```{r,eval=FALSE}
+# Plotting with ggplot2
+ggplot(summary_data, aes(x = Q, y = count, fill=Q)) +
+  geom_bar(stat = "identity") +
+  #geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Samples in Tercile Acceleration (window 0 to 70 weeks)",
+       x = "Acceleration",
+       y = " ",
+       fill = "Acceleration") +
+  theme_minimal()+
+  scale_fill_manual(values = c("Tercile1" = "skyblue3", "Tercile3" = "wheat3"))
+```
+First time-point (age) per category
+
+```{r,eval=FALSE}
+data2<-data %>%
+  group_by(ID) %>% 
+  slice(1) %>% group_by(Q) %>% summarise(mean_tstart=mean(tstart))
+
+data2
+```
+
+
+
+```{r}
+kable(head(AA)) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+
+```{r}
+if (params$sex != "All" & params$strain != "All"){
+formula1<-as.formula("Y~Q+age_wk")
+formula2<-as.formula("Y~Q+strata(age_wk)+strata(cohort)")
+Y<-Surv(time = Terciles$tstart,time2 = Terciles$tstop,Terciles$status)
+mod3<-phreg(formula1, dist="gompertz",param="rate",data=Terciles)
+mod4<-coxph(formula2,id=ID,data = Terciles)
+}
+```
+
+
+```{r}
+if (params$sex =="All" & params$strain != "All"){
+formula1<-as.formula("Y~Q+age_wk+sex")
+formula2<-as.formula("Y~Q+strata(age_wk)+strata(cohort)+strata(sex)")
+Y<-Surv(time = Terciles$tstart,time2 = Terciles$tstop,Terciles$status)
+mod3<-phreg(formula1, dist="gompertz",param="rate",data=Terciles)
+mod4<-coxph(formula2,id=ID,data = Terciles)
+mod42<-coxph(formula1,id=ID,data = Terciles)
+}
+```
+
+
+```{r}
+if (params$sex !="All" & params$strain == "All"){
+formula1<-as.formula("Y~Q+age_wk+strain")
+formula2<-as.formula("Y~Q+strata(age_wk)+strata(cohort)+strata(strain)")
+Y<-Surv(time = Terciles$tstart,time2 = Terciles$tstop,Terciles$status)
+mod3<-phreg(formula1, dist="gompertz",param="rate",data=Terciles)
+mod4<-coxph(formula2,id=ID,data = Terciles)
+mod42<-coxph(formula1,id=ID,data = Terciles)}
+```
+
+
+```{r}
+if (params$sex =="All" & params$strain == "All"){
+formula1<-as.formula("Y~Q+age_wk+sex+strain")
+formula2<-as.formula("Y~Q+strata(age_wk)+strata(sex)+strata(cohort)+strata(strain)")
+Y<-Surv(time = Terciles$tstart,time2 = Terciles$tstop,AA$status)
+mod3<-phreg(formula1, dist="gompertz",param="rate",data=Terciles)
+mod4<-coxph(formula2,id=ID,data = Terciles)
+mod42<-coxph(formula1,id=ID,data = Terciles)}
+
+
+```
+
+#### Cox
+
+```{r}
+cat("Sex: ",params$sex,". Strain: ",params$strain,". Acceleration = ", params$method,". Dataset = ", params$dataset)
+```
+
+```{r}
+formula2
+```
+
+
+
+```{r}
+summary(mod4)
+```
+
+#### Gompertz
+
+```{r}
+formula1
+```
+
+```{r}
+summary(mod3)
+```
+
+### Kaplan-Meier curves
+
+```{r }
+Ter<-Terciles[Terciles$Q!="Tercile2",]
+Ter$Q<-as.factor(as.character(Ter$Q))
+Ter<- Ter %>% mutate(Q = fct_recode(Q,
+                                "T1" = "Tercile1",
+                                "T3" = "Tercile3"))
+```
+
+
+
+
+```{r }
+
+moCox<-survfit(Surv(tstart, tstop, status)~Q,Ter)
+
+mod4_summary <- summary(mod4)
+coeff<-mod4_summary$conf.int[2,]
+pv<-round(mod4_summary$coefficients[2,5],digits=3)
+pv<-ifelse(pv==0,"<0.001",pv)
+HR<-paste0("HR(T3vsT1): ",round(coeff[1],digits = 2),"(",round(coeff[3],digits = 2),"-",round(coeff[4],digits = 2),"); p=",pv)
+
+library(survminer)
+if(params$dataset=="All"){eti<-"All animals "}
+if(params$dataset=="validate2"){eti<-"Validation 2 set "}
+if(params$dataset=="vald"){eti<-"Cohort C07-G08 set "}
+if(params$dataset=="All_held_out"){eti<-"Validation"}
+if(params$dataset=="train"){eti<-"Training set"}
+
+risk_table_theme <- theme(
+  axis.text = element_text(size = 8),
+  axis.text.y = element_text(size = 8),# Adjust font size for the risk table
+  # You can add more theme customization here as needed
+)
+
+
+Title<-paste0(eti, ": n = ",sum(table(unique(Terciles$ID))),"; ",HR,sep="")
+KM1<-ggsurvplot(moCox, data = Ter,
+                subtitle=Title,size = 1,
+           ylab = "Survivorship", 
+           conf.int = F,censor=F,
+           legend="none",
+           xlab = "Age (Weeks)", xlim = c(25,200),
+           risk.table = TRUE,
+           palette = c("Dark Green","Red"),
+           tables.theme = list(
+    risk_table_theme  # Apply the customized table theme
+  ),
+           ggtheme=theme_linedraw(base_size=8, base_family = "Helvetica"))
+KM1
+```
+
+```{r }
+library(ggpubr)
+KM3<-ggarrange(KM1$plot, KM1$table, ncol = 1, heights = c(2, 1))
+#K2<- cowplot::plot_grid(KM1$plot, KM1$table, ncol = 1, rel_heights = c(2, 1))
+```
+
+
+```{r, eval=TRUE}
+pa<-paste0(patho,"Plots/Survi_wide_Table_70_3_vald",params$dataset,"_sx_",params$sex,"_st",params$strain,".tiff",sep="")
+ggsave(filename =pa, plot = KM3, device = "tiff", dpi = 450, width = 10, height = 10, units = "cm")
+
+#ggsave(filename =pa, plot = KM3, device = "tiff", dpi = 450, width = 6, height = 6, units = "cm")
+```
