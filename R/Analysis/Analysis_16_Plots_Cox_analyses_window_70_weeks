@@ -1,5 +1,5 @@
 ---
-title: "Plots Cox Gompertz analysis 9 window 70, `r params$dataset`" 
+title: "Plots Cox window 0-70 weeks, `r params$dataset`" 
 subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
 
 author: "Jorge Martinez-Romero"
