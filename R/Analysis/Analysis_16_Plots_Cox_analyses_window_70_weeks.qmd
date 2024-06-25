@@ -3,7 +3,7 @@ title: "Plots Cox window 0-70 weeks, `r params$dataset`"
 subtitle: "(Sex :`r params$sex`, Strain:`r params$strain`, Dataset:`r params$dataset`, Method to calculate Acceleration:`r params$method`) "
 
 author: "Jorge Martinez-Romero"
-date: "2024-05-23"
+date: "2024-06-25"
 format: html 
 params:
   terc_at_70: "yes"
