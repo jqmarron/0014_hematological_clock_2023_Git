@@ -1,5 +1,5 @@
-<h1> The blood has something to say </h1>
-<h2> A hematology-based clock to measure aging in mice </h2>
+<h1> A hematology-based clock to detect biological age </h1>
+<h2> emerging from the Study of Longitudinal Aging in Mice (SLAM) </h2>
 TGB-LEPS. National Institute on Aging. NIH
 <h3> Abstract </h3>
 
