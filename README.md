@@ -1,5 +1,5 @@
-<h1> A hematology-based clock to detect biological age </h1>
-<h2> emerging from the Study of Longitudinal Aging in Mice (SLAM) </h2>
+<h1> A hematology-based clock </h1>
+<h2> Derived from the Study of Longitudinal Aging in Mice to estimate biological age </h2>
 TGB-LEPS. National Institute on Aging. NIH
 <h3> Abstract </h3>
 
